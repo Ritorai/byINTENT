@@ -1,6 +1,6 @@
-// Right panel: Account Equity card + order ticket, mirroring papertrade's
-// ticket behaviour (validation rules, max-margin limits, bust formula, slider
-// curve, help tooltips and the chart LIQ preview) as decoded from their bundle.
+// Right panel: the order ticket. Side → size → leverage → (trigger, stop, expiry)
+// → risk summary → one execute button labelled with what it does. Validation
+// rules, max-margin limits, bust formula and slider curve follow papertrade's.
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useAccount, useConnect, useSwitchChain, useWalletClient } from "wagmi";
@@ -50,7 +50,8 @@ interface TicketProps {
   trigStore?: RemoteTriggerStore | null;
 }
 
-const QUICK_LEV = [5, 10, 50, 100, 1000];
+const QUICK_LEV = [2, 5, 10, 25, 50, 100];
+const SIZE_PCT = [25, 50, 75, 100];
 const SLIDER_MAX = 10_000;
 const CURVE = 2.8;
 // leverage ↔ slider position, same curve as theirs
@@ -102,7 +103,6 @@ export default function Ticket({
   const phase = triggerPhase(trigStore, nowTick);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
-  const [showDetails, setShowDetails] = useState(true);
   const [hover, setHover] = useState(false);
   const [focus, setFocus] = useState(false);
   const [, setTick] = useState(0);
@@ -121,10 +121,6 @@ export default function Ticket({
   const minTrade = proto?.minimumTradeUsdc ?? 10;
   const minNotional = proto?.minimumOpenNotionalUsdc ?? 1000;
   const available = snapshot?.available ?? 0;
-  const marginInUse = (snapshot?.locked ?? 0) + (snapshot?.queued ?? 0);
-  // the stream's `balance` is the *free* balance (equals funds.availableBalance), so equity is
-  // the sum of the three rows shown below: available + margin in use + unrealised PnL
-  const equity = available + marginInUse + openPnl;
   const isLong = side === "long";
 
   const session = sessionStatus(address);
@@ -372,41 +368,29 @@ export default function Ticket({
   const sliderPos = levToSlider(Math.min(maxLev, Math.max(1, leverage)), maxLev);
   const sideClass = isLong ? "lo" : "sh";
 
+  // ---- risk block: what the trader is actually committing ----
+  // Reference price: the live mark for a market order, the trigger level for a trigger.
+  const refPrice = mode === "trigger" ? (triggerValid ? triggerPrice : null) : lastPrice;
+  const liq = refPrice ? bustPrice(refPrice, leverage, isLong, inst?.bustBuffer ?? 0) : null;
+  const liqDistPct = refPrice && liq ? (Math.abs(refPrice - liq) / refPrice) * 100 : null;
+  // Without a stop the whole isolated margin is at risk; with a stop on fill, the estimated loss there.
+  const maxLoss = marginValid ? (stopEstimate ? stopEstimate.loss : margin) : null;
+  const sizePctOfFree = snapshot && marginValid && limit.maximum > 0 ? Math.min(100, (margin / limit.maximum) * 100) : null;
+  const ctaLabel =
+    mode === "trigger"
+      ? t(isLong ? "ticket.cta.armLong" : "ticket.cta.armShort", {
+          market,
+          cmp: triggerCross === "down-to" ? "≤" : "≥",
+          price: triggerValid ? fmtPrice(triggerPrice) : "—",
+        })
+      : t(isLong ? "ticket.cta.long" : "ticket.cta.short", {
+          market,
+          lev: leverage,
+          notional: marginValid ? fmtUsd(notional, 0) : "—",
+        });
+
   return (
     <>
-      {/* account equity */}
-      <div className="acct-card">
-        <button
-          className="eq-head"
-          title={t("ticket.help.equity")}
-          aria-expanded={showDetails}
-          onClick={() => setShowDetails((s) => !s)}
-        >
-          <span>
-            <i className={showDetails ? "chev open" : "chev"} /> {t("ticket.accountEquity")}
-          </span>
-          <b className="numeric">{snapshot ? fmtUsd(equity) : "—"}</b>
-        </button>
-        {showDetails && (
-          <div className="eq-details">
-            <div className="kv">
-              <span className="help-term" title={t("ticket.help.available")}>{t("ticket.availableToTrade")}</span>
-              <b className="numeric">{snapshot ? fmtUsd(available) : "—"}</b>
-            </div>
-            <div className="kv">
-              <span className="help-term" title={t("ticket.help.marginInUse")}>{t("ticket.marginInUse")}</span>
-              <b className="numeric">{snapshot ? fmtUsd(marginInUse) : "—"}</b>
-            </div>
-            <div className="kv">
-              <span className="help-term" title={t("ticket.help.openPnl")}>{t("ticket.openPnl")}</span>
-              <b className={`numeric ${openPnl >= 0 ? "up" : "down"}`}>
-                {snapshot ? `${openPnl >= 0 ? "+" : ""}${fmtUsd(openPnl)}` : "—"}
-              </b>
-            </div>
-          </div>
-        )}
-      </div>
-
       {/* ticket — hovering or focusing anything inside shows the LIQ preview on the chart */}
       <div
         className="order-ticket"
@@ -417,7 +401,7 @@ export default function Ticket({
         }}
       >
         {onArmEntry && (
-          <div className="dtog modetog" role="tablist" aria-label={t("ticket.modeLabel")}>
+          <div className="seg seg-mode" role="tablist" aria-label={t("ticket.modeLabel")}>
             <button role="tab" className={mode === "market" ? "on" : ""} aria-selected={mode === "market"} onClick={() => pickMode("market")}>
               {t("ticket.modeMarket")}
             </button>
@@ -427,7 +411,7 @@ export default function Ticket({
           </div>
         )}
         {onMarket && (
-          <div className="dtog mtog" role="tablist" aria-label={t("ticket.market")}>
+          <div className="seg" role="tablist" aria-label={t("ticket.market")}>
             {(Object.keys(MARKETS) as MarketKey[]).map((k) => (
               <button key={k} role="tab" className={k === market ? "on" : ""} aria-selected={k === market} onClick={() => onMarket(k)}>
                 {k}
@@ -435,41 +419,25 @@ export default function Ticket({
             ))}
           </div>
         )}
-        <div className="dtog">
-          <button className={isLong ? "dup on" : "dup"} aria-pressed={isLong} onClick={() => setSide("long")}>
+
+        <div className="side-sel" role="radiogroup" aria-label={t("ticket.modeLabel")}>
+          <button className={isLong ? "side-btn long on" : "side-btn long"} role="radio" aria-checked={isLong} onClick={() => setSide("long")}>
             {t("ticket.long")}
           </button>
-          <button className={!isLong ? "ddn on" : "ddn"} aria-pressed={!isLong} onClick={() => setSide("short")}>
+          <button className={!isLong ? "side-btn short on" : "side-btn short"} role="radio" aria-checked={!isLong} onClick={() => setSide("short")}>
             {t("ticket.short")}
           </button>
         </div>
 
-        <div className="kv summary">
-          <span>{t("ticket.availableCollateral")}</span>
-          <b className="numeric">{snapshot ? fmtUsd(available) : "—"}</b>
-        </div>
-
+        {/* size */}
         <div className="fld">
-          <label htmlFor="margin-in">{t("ticket.marginUsdc")}</label>
-          <div className="irow">
-            <button className="qb" title={t("ticket.help.halve")} onClick={() => setMarginManual(margin / 2)}>
-              ½×
-            </button>
-            <button
-              className="qb"
-              title={t("ticket.help.double")}
-              onClick={() => setMarginManual(snapshot ? Math.min(margin * 2, limit.maximum) : margin * 2)}
-            >
-              2×
-            </button>
-            <button
-              className={followMax ? "qb on" : "qb"}
-              title={t("ticket.help.max")}
-              aria-pressed={followMax}
-              onClick={() => setFollowMax(true)}
-            >
-              {t("ticket.max")}
-            </button>
+          <div className="fld-head">
+            <label htmlFor="margin-in">{t("ticket.marginUsdc")}</label>
+            <span className="fld-aux">
+              {t("ticket.free")} <b className="numeric">{snapshot ? fmtUsd(available) : "—"}</b>
+            </span>
+          </div>
+          <div className="fld-in">
             <input
               id="margin-in"
               type="number"
@@ -482,64 +450,94 @@ export default function Ticket({
                 setMarginText(e.target.value);
               }}
             />
+            <span className="fld-unit">USDC</span>
+          </div>
+          <div className="presets">
+            {SIZE_PCT.map((p) => {
+              const on = p === 100 ? followMax : !followMax && sizePctOfFree != null && Math.abs(sizePctOfFree - p) < 0.5;
+              return (
+                <button
+                  key={p}
+                  className={on ? "preset on" : "preset"}
+                  aria-pressed={on}
+                  disabled={!snapshot}
+                  title={p === 100 ? t("ticket.help.max") : undefined}
+                  onClick={() => (p === 100 ? setFollowMax(true) : setMarginManual((limit.maximum * p) / 100))}
+                >
+                  {p === 100 ? t("ticket.max") : t("ticket.sizePct", { p })}
+                </button>
+              );
+            })}
           </div>
         </div>
 
+        {/* leverage */}
         <div className="fld">
-          <label htmlFor="lev-in">{t("ticket.leverage")}</label>
-          <div className="irow">
-            {QUICK_LEV.filter((l) => l <= maxLev).map((l) => (
-              <button
-                key={l}
-                className={leverage === l ? "qb on" : "qb"}
-                aria-pressed={leverage === l}
-                onClick={() => setLeverage(l)}
-              >
+          <div className="fld-head">
+            <label htmlFor="lev-in">{t("ticket.leverage")}</label>
+            <span className="fld-aux">
+              {t("ticket.orderValue")} <b className="numeric">{marginValid ? fmtUsd(notional) : "—"}</b>
+            </span>
+          </div>
+          <div className="lev-row">
+            <div className="fld-in lev-in">
+              <input
+                id="lev-in"
+                type="number"
+                inputMode="numeric"
+                min={1}
+                max={maxLev}
+                step={1}
+                value={leverage}
+                onKeyDown={(e) => {
+                  if (!e.ctrlKey && !e.metaKey && [".", ",", "e", "E", "+", "-"].includes(e.key)) e.preventDefault();
+                }}
+                onChange={(e) => {
+                  const n = Math.round(Number(e.target.value));
+                  if (Number.isFinite(n)) setLeverage(Math.min(maxLev, Math.max(1, n)));
+                }}
+              />
+              <span className="fld-unit">x</span>
+            </div>
+            <div className="strack">
+              <div className="sthumb" style={{ left: `${(sliderPos / SLIDER_MAX) * 100}%` }} />
+              <input
+                className="lev-range"
+                type="range"
+                min={0}
+                max={SLIDER_MAX}
+                step={1}
+                aria-label={t("ticket.sliderLabel")}
+                aria-valuetext={`${leverage}x`}
+                value={sliderPos}
+                onChange={(e) => setLeverage(sliderToLev(Number(e.target.value), maxLev))}
+              />
+            </div>
+          </div>
+          <div className="presets">
+            {QUICK_LEV.filter((l) => l < maxLev).map((l) => (
+              <button key={l} className={leverage === l ? "preset on" : "preset"} aria-pressed={leverage === l} onClick={() => setLeverage(l)}>
                 {l}x
               </button>
             ))}
-            <input
-              id="lev-in"
-              type="number"
-              inputMode="numeric"
-              min={1}
-              max={maxLev}
-              step={1}
-              value={leverage}
-              onKeyDown={(e) => {
-                if (!e.ctrlKey && !e.metaKey && [".", ",", "e", "E", "+", "-"].includes(e.key)) e.preventDefault();
-              }}
-              onChange={(e) => {
-                const n = Math.round(Number(e.target.value));
-                if (Number.isFinite(n)) setLeverage(Math.min(maxLev, Math.max(1, n)));
-              }}
-            />
-          </div>
-          <div className="strack">
-            <div className="sthumb" style={{ left: `${(sliderPos / SLIDER_MAX) * 100}%` }} />
-            <input
-              className="lev-range"
-              type="range"
-              min={0}
-              max={SLIDER_MAX}
-              step={1}
-              aria-label={t("ticket.sliderLabel")}
-              aria-valuetext={`${leverage}x`}
-              value={sliderPos}
-              onChange={(e) => setLeverage(sliderToLev(Number(e.target.value), maxLev))}
-            />
-          </div>
-          <div className="slbl">
-            <span>{t("ticket.safe")}</span>
-            <span>{t("ticket.wild", { n: maxLev })}</span>
+            <button className={leverage === maxLev ? "preset on" : "preset"} aria-pressed={leverage === maxLev} onClick={() => setLeverage(maxLev)}>
+              {maxLev}x
+            </button>
           </div>
         </div>
 
         {mode === "trigger" && (
           <>
             <div className="fld">
-              <label htmlFor="trig-in">{t("ticket.triggerPrice")}</label>
-              <div className="irow">
+              <div className="fld-head">
+                <label htmlFor="trig-in">{t("ticket.triggerPrice")}</label>
+                {triggerValid && lastPrice != null && (
+                  <span className={`fld-aux tag ${triggerCross === "down-to" ? "down" : "up"}`}>
+                    {triggerCross === "down-to" ? "≤" : "≥"} {t((isLong) === (triggerCross === "down-to") ? "ticket.pullback" : "ticket.breakout")}
+                  </span>
+                )}
+              </div>
+              <div className="fld-in">
                 <input
                   id="trig-in"
                   type="number"
@@ -549,101 +547,114 @@ export default function Ticket({
                   value={triggerText}
                   onChange={(e) => setTriggerText(e.target.value)}
                 />
+                <span className="fld-unit">USD</span>
               </div>
             </div>
 
             <div className="fld">
-              <label>{t("ticket.expiry")}</label>
-              <div className="irow">
-                {(["never", "1h", "24h", "7d"] as const).map((x) => (
-                  <button
-                    key={x}
-                    className={expiry === x ? "qb on" : "qb"}
-                    aria-pressed={expiry === x}
-                    onClick={() => setExpiry(x)}
-                  >
-                    {t(`ticket.exp.${x}` as I18nKey)}
-                  </button>
-                ))}
+              <div className="fld-head">
+                <label htmlFor="trig-stop-in" title={t("ticket.stopOnFillWhy")}>
+                  {t("ticket.stopOnFill")}
+                </label>
+                <div className="seg seg-mini" role="tablist">
+                  {(["off", "pct", "price"] as const).map((x) => (
+                    <button
+                      key={x}
+                      role="tab"
+                      className={stopMode === x ? "on" : ""}
+                      aria-selected={stopMode === x}
+                      onClick={() => {
+                        setStopMode(x);
+                        // switching unit converts the value: a fixed price starts from the trigger
+                        // price minus the typed % so the user edits a sensible number, never "$2"
+                        if (x === "price" && (stopText.trim() === "" || stopMode === "pct") && triggerValid) {
+                          const typedPct = Number(stopText);
+                          const pct = stopMode === "pct" && Number.isFinite(typedPct) && typedPct > 0 ? typedPct / 100 : 0.02;
+                          setStopText(String(Math.round(triggerPrice * (isLong ? 1 - pct : 1 + pct) * 10) / 10));
+                        }
+                        if (x === "pct" && (stopText.trim() === "" || stopMode === "price")) setStopText("2");
+                        if (x === "off") setStopText("");
+                      }}
+                    >
+                      {x === "off" ? t("ticket.stopOff") : x === "pct" ? "%" : "$"}
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
-
-            <div className="fld">
-              <label htmlFor="trig-stop-in" title={t("ticket.stopOnFillWhy")}>
-                {t("ticket.stopOnFill")}
-              </label>
-              <div className="irow">
-                {(["off", "pct", "price"] as const).map((x) => (
-                  <button
-                    key={x}
-                    className={stopMode === x ? "qb on" : "qb"}
-                    aria-pressed={stopMode === x}
-                    onClick={() => {
-                      setStopMode(x);
-                      // switching unit converts the value: a fixed price starts from the trigger
-                      // price minus the typed % so the user edits a sensible number, never "$2"
-                      if (x === "price" && (stopText.trim() === "" || stopMode === "pct") && triggerValid) {
-                        const typedPct = Number(stopText);
-                        const pct = stopMode === "pct" && Number.isFinite(typedPct) && typedPct > 0 ? typedPct / 100 : 0.02;
-                        setStopText(String(Math.round(triggerPrice * (isLong ? 1 - pct : 1 + pct) * 10) / 10));
-                      }
-                      if (x === "pct" && (stopText.trim() === "" || stopMode === "price")) setStopText("2");
-                      if (x === "off") setStopText("");
-                    }}
-                  >
-                    {x === "off" ? t("ticket.stopOff") : x === "pct" ? "%" : "$"}
-                  </button>
-                ))}
-                {stopMode !== "off" && (
+              {stopMode !== "off" && (
+                <div className={stopProblem && stopTyped ? "fld-in warn" : "fld-in"}>
                   <input
                     id="trig-stop-in"
                     type="number"
                     inputMode="decimal"
                     min={0}
                     step="any"
-                    className={stopProblem && stopTyped ? "warn-input" : undefined}
                     placeholder={stopMode === "pct" ? "2" : t("trig.stopPrice")}
                     value={stopText}
                     onChange={(e) => setStopText(e.target.value)}
                   />
-                )}
+                  <span className="fld-unit">{stopMode === "pct" ? "%" : "USD"}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="fld">
+              <div className="fld-head">
+                <label>{t("ticket.expiry")}</label>
+                <div className="seg seg-mini" role="tablist">
+                  {(["1h", "24h", "7d", "never"] as const).map((x) => (
+                    <button key={x} role="tab" className={expiry === x ? "on" : ""} aria-selected={expiry === x} onClick={() => setExpiry(x)}>
+                      {x === "never" ? "∞" : t(`ticket.exp.${x}` as I18nKey)}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
 
-            {triggerValid && (
-              <div className="hint small">
-                {t("ticket.trigFires", {
-                  side: t(isLong ? "house.long" : "house.short"),
-                  lev: leverage,
-                  market,
-                  cmp: triggerCross === "down-to" ? "≤" : "≥",
-                  price: fmtPrice(triggerPrice),
-                })}
-              </div>
-            )}
-            {stopEstimate && (
-              <div className="hint small">
-                {t("ticket.stopOnFillEst", {
-                  cmp: isLong ? "≤" : "≥",
-                  price: fmtPrice(stopEstimate.level),
-                  loss: fmtUsd(stopEstimate.loss),
-                  pct: stopEstimate.pctOfMargin.toFixed(0),
-                })}
-              </div>
-            )}
             {stopProblem && stopTyped && <div className="hint small warn-text">{stopProblem}</div>}
             {triggerAlreadyPast && <div className="hint small warn-text">{t("ticket.trigAlreadyPast")}</div>}
           </>
         )}
 
-        <div className="trade-summary">
+        {/* risk summary */}
+        <div className="risk-sum">
           <div className="kv">
-            <span>{t("ticket.orderValue")}</span>
-            <b className="numeric">{marginValid ? fmtUsd(notional) : "—"}</b>
+            <span>{t("ticket.entry")}</span>
+            <b className="numeric">
+              {mode === "trigger"
+                ? triggerValid
+                  ? fmtPrice(triggerPrice)
+                  : "—"
+                : lastPrice
+                  ? <>
+                      <i>{t("ticket.entryMarket")}</i> ~{fmtPrice(lastPrice)}
+                    </>
+                  : "—"}
+            </b>
           </div>
           <div className="kv">
-            <span className="help-term" title={t("ticket.help.bust")}>{t("ticket.bustPrice")}</span>
-            <b className="numeric">{bust ? `$${fmtPrice(bust)}` : "—"}</b>
+            <span title={t("ticket.help.bust")}>{t("ticket.bustPrice")}</span>
+            <b className="numeric">
+              {liq ? (
+                <>
+                  {fmtPrice(liq)} <i>{t("ticket.liqDist", { pct: liqDistPct!.toFixed(liqDistPct! < 1 ? 2 : 1) })}</i>
+                </>
+              ) : (
+                "—"
+              )}
+            </b>
+          </div>
+          <div className="kv">
+            <span>{t("ticket.maxLoss")}</span>
+            <b className="numeric down">
+              {maxLoss != null ? (
+                <>
+                  −{fmtUsd(maxLoss)} <i>{stopEstimate ? t("ticket.maxLossAtStop") : t("ticket.maxLossFull")}</i>
+                </>
+              ) : (
+                "—"
+              )}
+            </b>
           </div>
         </div>
 
@@ -686,7 +697,7 @@ export default function Ticket({
               disabled={busy || !!problem || !!triggerProblem || !!stopProblem}
               onClick={() => void doArm()}
             >
-              {busy ? t("ticket.submitting") : problem ?? triggerProblem ?? stopProblem ?? t("ticket.armTrigger")}
+              {busy ? t("ticket.submitting") : problem ?? triggerProblem ?? stopProblem ?? ctaLabel}
             </button>
           )
         ) : session.state === "none" || session.state === "expired" ? (
@@ -705,7 +716,7 @@ export default function Ticket({
           </button>
         ) : (
           <button className={`gobtn ${sideClass}`} disabled={busy || !!problem} onClick={doPlace}>
-            {busy ? t("ticket.submitting") : problem ?? `${t("ticket.placeTrade")}${queuedOpens ? ` (${queuedOpens + 1})` : ""}`}
+            {busy ? t("ticket.submitting") : problem ?? `${ctaLabel}${queuedOpens ? ` (${queuedOpens + 1})` : ""}`}
           </button>
         )}
 

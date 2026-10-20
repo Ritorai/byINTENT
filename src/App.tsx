@@ -126,6 +126,7 @@ export default function App() {
   const [volumes, setVolumes] = useState<Record<number, number>>({});
   const [changes, setChanges] = useState<Record<number, number>>({});
   const [lastPrice, setLastPrice] = useState<number | null>(null);
+  const [lastTickAt, setLastTickAt] = useState(0);
   const [marks, setMarks] = useState<Record<number, number>>({});
   const marksRef = useRef(marks);
   marksRef.current = marks;
@@ -303,6 +304,7 @@ export default function App() {
     if (known) document.title = `$${fmtPrice(known)} · ${market} · byINTENT`;
     feed.onTick = (tick) => {
       setLastPrice(tick.p);
+      setLastTickAt(Date.now());
       setMarks((m) => (m[MARKETS[market].id] === tick.p ? m : { ...m, [MARKETS[market].id]: tick.p }));
       document.title = `$${fmtPrice(tick.p)} · ${market} · byINTENT`;
     };
@@ -560,22 +562,42 @@ export default function App() {
     if (!mark) return acc;
     return acc + (mark - p.entryPrice) * (p.isLong ? 1 : -1) * ((p.margin * p.leverage) / p.entryPrice);
   }, 0);
+  const free = liveSnap?.available ?? 0;
+  const inUse = (liveSnap?.locked ?? 0) + (liveSnap?.queued ?? 0);
+  const equity = free + inUse + openPnl;
+
+  // ---- status line: is everything that can hurt me actually working? ----
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => forceTick((n) => n + 1), 5000);
+    return () => clearInterval(id);
+  }, []);
+  const feedOk = lastTickAt > 0 && Date.now() - lastTickAt < 15_000;
+  const protoState: "live" | "paused" | "offline" = !proto ? "offline" : proto.tradingPaused ? "paused" : "live";
+  const trigState: "live" | "paused" | "offline" | "off" = !trigStore
+    ? "off"
+    : trigStore.apiDown || !trigStore.me
+      ? "offline"
+      : trigStore.me.kill?.on
+        ? "paused"
+        : trigStore.me.watcher.alive
+          ? "live"
+          : "offline";
 
   const statsbar = (
-    <div className="statsbar">
+    <div className="instbar">
       <div className="asset-pill" ref={marketPillRef}>
         <button className="asset-trigger" aria-haspopup="listbox" aria-expanded={marketMenu} onClick={() => setMarketMenu((o) => !o)}>
           <b className="asset-coin">{market}</b>
-          <span className="asset-sep" />
-          <span className="price">{lastPrice ? `$${fmtPrice(lastPrice)}` : "…"}</span>
-          {change24h != null && (
-            <span className={change24h >= 0 ? "move up" : "move down"}>
-              {change24h >= 0 ? "+" : ""}
-              {(change24h * 100).toFixed(2)}%
-            </span>
-          )}
           <i className={marketMenu ? "chev open" : "chev"} />
         </button>
+        <span className="price numeric">{lastPrice ? fmtPrice(lastPrice) : "…"}</span>
+        {change24h != null && (
+          <span className={change24h >= 0 ? "move up" : "move down"}>
+            {change24h >= 0 ? "+" : ""}
+            {(change24h * 100).toFixed(2)}%
+          </span>
+        )}
         {marketMenu && (
           <div className="market-menu" role="listbox">
             {(Object.keys(MARKETS) as MarketKey[]).map((k) => {
@@ -609,7 +631,7 @@ export default function App() {
         )}
       </div>
 
-      <div className="market-stats-pill">
+      <div className="inst-stats">
         {phone ? (
           <div className="tf-dd" ref={tfRef}>
             <button className="tf-dd-trigger" aria-haspopup="listbox" aria-expanded={tfMenu} onClick={() => setTfMenu((o) => !o)}>
@@ -639,19 +661,17 @@ export default function App() {
           <>
             <span className="ms-cell">
               <i className="ms-label">{t("stats.vol24h")}</i>
-              <span className="ms-value">{volumes[MARKETS[market].id] != null ? fmtUsd(volumes[MARKETS[market].id]) : "—"}</span>
+              <span className="ms-value numeric">{volumes[MARKETS[market].id] != null ? fmtUsd(volumes[MARKETS[market].id], 0) : "—"}</span>
             </span>
-            <span className="ms-div" />
             <span className="ms-cell">
-              <i className="ms-label">{t("stats.longOi")}</i>
-              <span className="ms-value">{inst && lastPrice ? fmtUsd(inst.longOi * lastPrice) : "—"}</span>
+              <i className="ms-label">{t("stats.oi")}</i>
+              <span className="ms-value numeric">
+                <em className="up">{inst && lastPrice ? fmtUsd(inst.longOi * lastPrice, 0) : "—"}</em>
+                <em className="ms-slash">/</em>
+                <em className="down">{inst && lastPrice ? fmtUsd(inst.shortOi * lastPrice, 0) : "—"}</em>
+              </span>
             </span>
-            <span className="ms-div" />
-            <span className="ms-cell">
-              <i className="ms-label">{t("stats.shortOi")}</i>
-              <span className="ms-value">{inst && lastPrice ? fmtUsd(inst.shortOi * lastPrice) : "—"}</span>
-            </span>
-            <span className="ms-div" />
+            <span className="spacer" />
             <span className="tfs">
               {TIMEFRAMES.map((tf) => (
                 <button key={tf} className={tf === timeframe ? "tf on" : "tf"} onClick={() => setTimeframe(tf)}>
@@ -661,15 +681,28 @@ export default function App() {
             </span>
           </>
         )}
-        <button
-          className={following ? "live-btn" : "live-btn reset"}
-          title={following ? t("stats.chartLive") : t("stats.backToLive")}
-          onClick={() => chartState.current.resetView?.()}
-        >
-          {following ? t("stats.live") : t("stats.reset")}
-        </button>
       </div>
     </div>
+  );
+
+  const Dot = ({ state }: { state: string }) => <i className={`dot ${state}`} aria-hidden />;
+  const statusline = (
+    <footer className="statusline">
+      <span className="st">
+        <Dot state={feedOk ? "live" : "stale"} />
+        {t("status.feed")} <b>{t(feedOk ? "status.live" : "status.stale")}</b>
+      </span>
+      <span className="st">
+        <Dot state={protoState} />
+        {t("status.protocol")} <b>{t(`status.${protoState}` as I18nKey)}</b>
+      </span>
+      <span className="st">
+        <Dot state={trigState} />
+        {t("status.triggers")} <b>{t(`status.${trigState}` as I18nKey)}</b>
+      </span>
+      <span className="spacer" />
+      <span className="st-note">{t("status.disclaimer")}</span>
+    </footer>
   );
 
   const dark = theme === "dark";
@@ -681,6 +714,25 @@ export default function App() {
           by<span className="logo-accent">INTENT</span>
         </div>
         <div className="spacer" />
+        {liveSnap && (
+          <div className="acct">
+            <span className="acct-cell">
+              <i>{t("acct.equity")}</i>
+              <b className="numeric">{fmtUsd(equity)}</b>
+            </span>
+            <span className="acct-cell">
+              <i>{t("acct.free")}</i>
+              <b className="numeric">{fmtUsd(free)}</b>
+            </span>
+            <span className="acct-cell">
+              <i>{t("acct.pnl")}</i>
+              <b className={`numeric ${openPnl >= 0 ? "up" : "down"}`}>
+                {openPnl >= 0 ? "+" : ""}
+                {fmtUsd(openPnl)}
+              </b>
+            </span>
+          </div>
+        )}
         <button className="topbtn" onClick={() => setFunding("deposit")}>
           {t("top.deposit")}
         </button>
@@ -714,6 +766,7 @@ export default function App() {
         style={{ "--panel-w": layout.panelW != null ? `${Math.max(layout.panelW, panelMin())}px` : undefined } as CSSProperties}
       >
         <section className="chart-card">
+          {statsbar}
           <div className="chart-body" ref={chartBodyRef}>
             <div className="draw-tools" role="toolbar" aria-label={t("tools.label")}>
               <button
@@ -752,7 +805,14 @@ export default function App() {
             </div>
             <div className="chart-wrap">
               <Chart state={chartState.current} onFollowChange={setFollowing} />
-              {statsbar}
+              {!following && (
+                <button className="chart-follow" title={t("stats.backToLive")} onClick={() => chartState.current.resetView?.()}>
+                  <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden>
+                    <path d="M3 8h8M8 4l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M13.5 3.5v9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                  </svg>
+                </button>
+              )}
             </div>
             {editing && editingDrawing && (
               <DrawingPopup
@@ -787,7 +847,7 @@ export default function App() {
             onSubmitted={pushNotice}
             onPreview={setPreview}
             apply={liqSet}
-            onArmEntry={trigStore ? onArmEntry : undefined}
+            onArmEntry={onArmEntry}
             trigStore={trigStore}
           />
         </aside>
@@ -813,6 +873,8 @@ export default function App() {
         height={layout.barH != null ? Math.max(layout.barH, BAR_MIN) : null}
         barRef={barRef}
       />
+
+      {statusline}
 
       <Funding mode={funding} snapshot={liveSnap} onClose={() => setFunding(null)} onAction={pushNotice} />
 

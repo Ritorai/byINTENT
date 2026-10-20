@@ -1,6 +1,6 @@
 // Bottom bar: Positions (open + queued intents with live queue rank + Cancel,
 // plus each position's stop-loss), Triggers (server-side trigger entries + stops,
-// see triggerApi.ts), History (closed trades), Status (protocol/queue).
+// see triggerApi.ts), History (closed trades).
 
 import { useEffect, useState, type Ref } from "react";
 import { useAccount } from "wagmi";
@@ -22,7 +22,7 @@ import type { PriceSample, RemoteTriggerStore as TriggerStore } from "./triggerA
 
 const SYMBOL: Record<number, string> = { 0: "BTC", 1: "ETH" };
 
-type Tab = "positions" | "orders" | "history" | "status";
+type Tab = "positions" | "orders" | "history";
 
 interface TradeBarProps {
   snapshot: WalletSnapshot | null;
@@ -207,23 +207,15 @@ export default function TradeBar({
           <button className={tab === "history" ? "tbtab on" : "tbtab"} onClick={() => setTab("history")}>
             {t("tb.history")}
           </button>
-          <button className={tab === "status" ? "tbtab on" : "tbtab"} onClick={() => setTab("status")}>
-            {t("tb.status")}
-          </button>
         </div>
-        {tab === "positions" && (
-          <div className="open-pos-row">
-            <span className="open-pos-label">
-              {t("tb.openPositions")} — <b className="numeric">{isConnected ? positions.length : "–"}</b>
-            </span>
-            <button
-              className="close-btn"
-              disabled={!canAct || busyId != null || positions.length === 0}
-              onClick={() => doClose(positions.filter((p) => !closingIds.has(p.positionId)).map((p) => p.positionId))}
-            >
-              {t("tb.closeAll")}
-            </button>
-          </div>
+        {tab === "positions" && positions.length > 0 && (
+          <button
+            className="close-btn close-all"
+            disabled={!canAct || busyId != null}
+            onClick={() => doClose(positions.filter((p) => !closingIds.has(p.positionId)).map((p) => p.positionId))}
+          >
+            {t("tb.closeAll")} ({positions.length})
+          </button>
         )}
       </div>
 
@@ -385,31 +377,6 @@ export default function TradeBar({
         </div>
       )}
 
-      {tab === "status" && (
-        <div className="tb-status">
-          <div className="kv">
-            <span>{t("tb.protocol")}</span>
-            <b>{proto ? (proto.tradingPaused ? t("tb.tradingPaused") : t("tb.tradingLive")) : "…"}</b>
-          </div>
-          <div className="kv">
-            <span>{t("tb.minTrade")}</span>
-            <b>{proto ? t("tb.minTradeVal", { m: proto.minimumTradeUsdc, n: fmtUsd(proto.minimumOpenNotionalUsdc) }) : "…"}</b>
-          </div>
-          {(proto?.instruments ?? []).map((i) => (
-            <div className="kv" key={i.id}>
-              <span>{t("tb.openInterestOf", { sym: i.symbol })}</span>
-              <b>
-                {marks[i.id]
-                  ? `▲ ${fmtUsd(i.longOi * marks[i.id])} / ▼ ${fmtUsd(i.shortOi * marks[i.id])}`
-                  : "…"}
-              </b>
-            </div>
-          ))}
-          <div className="hint small">
-            {t("tb.disclaimer")}
-          </div>
-        </div>
-      )}
     </section>
   );
 }
