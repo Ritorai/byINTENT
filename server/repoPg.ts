@@ -4,7 +4,7 @@
 // extracted into columns for indexing and atomic transitions.
 
 import type { Pool, PoolClient } from "pg";
-import type { AttachedStop } from "../shared/triggerLogic";
+import type { AttachedStop, ExitKind } from "../shared/triggerLogic";
 import type {
   AuditEvent,
   Heartbeat,
@@ -195,7 +195,7 @@ export class PgRepo implements Repo {
     }
     return false;
   }
-  async updateTriggerAndSpawn(rec: TriggerRecord, spawn: TriggerRecord) {
+  async updateTriggerAndSpawn(rec: TriggerRecord, spawns: TriggerRecord[]) {
     return this.tx(async (c) => {
       const r = await c.query(
         `UPDATE triggers SET status = $3, data = $4, version = version + 1, updated_at = now()
@@ -203,20 +203,22 @@ export class PgRepo implements Repo {
         [rec.id, rec.version, rec.status, JSON.stringify(toData(rec))]
       );
       if (r.rowCount !== 1) return false; // stale: nothing written, the commit is a no-op
-      await c.query(
-        `INSERT INTO triggers (id, wallet, kind, status, version, created_at, data) VALUES ($1,$2,$3,$4,1,$5,$6)`,
-        [spawn.id, spawn.wallet.toLowerCase(), spawn.kind, spawn.status, Math.floor(spawn.createdAt), JSON.stringify(toData(spawn))]
-      );
+      for (const spawn of spawns) {
+        await c.query(
+          `INSERT INTO triggers (id, wallet, kind, status, version, created_at, data) VALUES ($1,$2,$3,$4,1,$5,$6)`,
+          [spawn.id, spawn.wallet.toLowerCase(), spawn.kind, spawn.status, Math.floor(spawn.createdAt), JSON.stringify(toData(spawn))]
+        );
+      }
       rec.version += 1;
       return true;
     });
   }
-  async setAttachedStop(wallet: string, id: string, stop: AttachedStop | null) {
+  async setAttachedStop(wallet: string, id: string, stop: AttachedStop | null, which: ExitKind = "stop") {
     const r = await this.pool.query<Row>(
       `UPDATE triggers SET data = data || $3::jsonb, version = version + 1, updated_at = now()
        WHERE id = $1 AND wallet = $2 AND kind = 'entry' AND status IN ('armed','confirming','attention')
        RETURNING data, version`,
-      [id, wallet.toLowerCase(), JSON.stringify({ attachedStop: stop })]
+      [id, wallet.toLowerCase(), JSON.stringify(which === "tp" ? { attachedTp: stop } : { attachedStop: stop })]
     );
     return r.rows[0] ? fromRow(r.rows[0]) : null;
   }
@@ -253,11 +255,12 @@ export class PgRepo implements Repo {
   async requestCancelQueued(wallet: string, id: string) {
     return this.transition(wallet, id, ["queued"], { cancelRequested: true });
   }
-  async supersedeLiveStops(wallet: string, positionId: string) {
+  async supersedeLiveStops(wallet: string, positionId: string, exit: ExitKind = "stop") {
     const r = await this.pool.query(
       `UPDATE triggers SET status = 'cancelled', data = data || '{"status":"cancelled"}'::jsonb, version = version + 1, updated_at = now()
-       WHERE wallet = $1 AND kind = 'stop' AND status IN ('armed','confirming') AND data->>'positionId' = $2`,
-      [wallet.toLowerCase(), positionId]
+       WHERE wallet = $1 AND kind = 'stop' AND status IN ('armed','confirming') AND data->>'positionId' = $2
+         AND coalesce(data->>'exit', 'stop') = $3`,
+      [wallet.toLowerCase(), positionId, exit]
     );
     return r.rowCount ?? 0;
   }

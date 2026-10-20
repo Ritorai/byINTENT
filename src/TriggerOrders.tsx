@@ -17,9 +17,13 @@ import {
   TRIGGER_ERROR_KEYS,
   attachedStopLevel,
   attachedStopProblem,
+  attachedTpLevel,
+  attachedTpProblem,
+  exitOf,
   isTerminal,
   stopHit,
   type AttachedStop,
+  type ExitKind,
   type PriceSample,
   type StopLoss,
   type TriggerEntry,
@@ -40,8 +44,11 @@ const SYMBOL: Record<number, string> = Object.fromEntries(
 );
 const symbolOf = (instrumentId: number) => SYMBOL[instrumentId] ?? `#${instrumentId}`;
 const cmpOf = (cross: "down-to" | "up-to") => (cross === "down-to" ? "≤" : "≥");
-/** a long stop fires at/below its price, a short stop at/above */
-const stopCmp = (isLong: boolean) => (isLong ? "≤" : "≥");
+/** a long stop fires at/below its price, a short stop at/above; a take-profit is the mirror */
+const stopCmp = (isLong: boolean, exit: ExitKind = "stop") => ((exit === "tp") !== isLong ? "≤" : "≥");
+const typeKey = (item: StopLoss | TriggerEntry, isEntry: boolean): I18nKey =>
+  isEntry ? "trig.type.entry" : exitOf(item as StopLoss) === "tp" ? "trig.type.tp" : "trig.type.stop";
+const typeClass = (item: StopLoss | TriggerEntry, isEntry: boolean) => (isEntry ? "muted" : exitOf(item as StopLoss) === "tp" ? "trig-type-tp" : "trig-type-stop");
 
 const LIVE: ReadonlySet<TriggerStatus> = new Set(["armed", "confirming", "firing"]);
 const isLive = (s: TriggerStatus) => LIVE.has(s);
@@ -87,9 +94,12 @@ function Chip({ status }: { status: TriggerStatus }) {
 // ---------------------------------------------------------------------------
 
 /**
- * One cell in the open-positions row. Collapsed it is either the armed stop or
- * a "+ Stop" button; expanded it is a price box. Arming when price is already
- * past the level needs a second click (it closes the position immediately).
+ * One cell in the open-positions row. Collapsed it is either the armed exit or
+ * a "+ Stop" / "+ TP" button; expanded it is a price box. Arming when price is
+ * already past the level needs a second click (it closes the position
+ * immediately). `exit` picks the side: a stop lives on the loss side and is
+ * checked against the bust price; a take-profit lives on the profit side and
+ * only has to be past the entry.
  */
 export function StopCell({
   store,
@@ -97,17 +107,20 @@ export function StopCell({
   mark,
   livePrice,
   onNote,
+  exit = "stop",
 }: {
   store: TriggerStore | null;
   position: LivePosition;
   mark: number | undefined;
   livePrice: number | undefined;
   onNote: (msg: string) => void;
+  exit?: ExitKind;
 }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [confirmPast, setConfirmPast] = useState(false);
+  const isTp = exit === "tp";
 
   if (!store) return <span className="muted">—</span>;
   // every mutation is a round-trip now — a rejection must be said out loud, not swallowed
@@ -116,25 +129,26 @@ export function StopCell({
       if (!r.ok) onNote(apiErrorText(t, r));
     });
 
-  const current = store.stopFor(position.positionId);
+  const current = store.stopFor(position.positionId, exit);
   const armed = current && current.status !== "attention" ? current : undefined;
   const attention = current?.status === "attention" ? current : undefined;
   const priceRef = livePrice ?? mark;
+  const signed = (v: number) => `${v >= 0 ? "+" : "−"}${fmtUsd(Math.abs(v))}`;
 
   if (armed) {
-    const loss = pnlAt(position, armed.stopPrice);
+    const pnl = pnlAt(position, armed.stopPrice);
     const bustBuffer = mark != null ? (Math.abs(armed.stopPrice - position.bustPrice) / mark) * 100 : null;
-    const tight = bustBuffer != null && bustBuffer < STOP_BUST_MIN_BUFFER * 100;
+    const tight = !isTp && bustBuffer != null && bustBuffer < STOP_BUST_MIN_BUFFER * 100;
     return (
       <span className="stopcell">
         <b
-          className={tight ? "stop-at warn-text" : "stop-at"}
-          title={t("trig.lossAtStop", {
-            pnl: `${loss >= 0 ? "+" : "−"}${fmtUsd(Math.abs(loss))}`,
-            pct: ((loss / position.margin) * 100).toFixed(1),
+          className={tight ? "stop-at warn-text" : isTp ? "stop-at tp-at" : "stop-at"}
+          title={t(isTp ? "trig.gainAtTp" : "trig.lossAtStop", {
+            pnl: signed(pnl),
+            pct: ((pnl / position.margin) * 100).toFixed(1),
           })}
         >
-          {stopCmp(armed.isLong)} {fmtPrice(armed.stopPrice)}
+          {stopCmp(armed.isLong, exit)} {fmtPrice(armed.stopPrice)}
         </b>
         {armed.status !== "armed" && <Chip status={armed.status} />}
         <button className="xbtn" title={t("trig.cancel")} onClick={() => report(store.cancel(armed.id))}>
@@ -149,7 +163,7 @@ export function StopCell({
     return (
       <span className="stopcell">
         <b className="stop-at warn-text" title={t("trig.attentionNote")}>
-          {stopCmp(attention.isLong)} {fmtPrice(attention.stopPrice)}
+          {stopCmp(attention.isLong, exit)} {fmtPrice(attention.stopPrice)}
         </b>
         <button
           className="close-btn warn"
@@ -176,29 +190,36 @@ export function StopCell({
   if (!open)
     return (
       <span className="stopcell">
-        <button className="addstop" onClick={() => setOpen(true)} title={t("trig.closesEntire")}>
-          {t("trig.addStop")}
+        <button className={isTp ? "addstop addtp" : "addstop"} onClick={() => setOpen(true)} title={t(isTp ? "trig.tpClosesEntire" : "trig.closesEntire")}>
+          {t(isTp ? "trig.addTp" : "trig.addStop")}
         </button>
       </span>
     );
 
   const stopPrice = Number(text);
   const valid = text.trim() !== "" && Number.isFinite(stopPrice) && stopPrice > 0;
-  const beyondBust = valid && (position.isLong ? stopPrice < position.bustPrice : stopPrice > position.bustPrice);
-  const pastMarket = valid && priceRef != null && stopHit(priceRef, { isLong: position.isLong, stopPrice });
+  const beyondBust = !isTp && valid && (position.isLong ? stopPrice < position.bustPrice : stopPrice > position.bustPrice);
+  // a take-profit on the loss side of the entry would lock in a loss, not a profit
+  const wrongSide = isTp && valid && (position.isLong ? stopPrice <= position.entryPrice : stopPrice >= position.entryPrice);
+  const pastMarket = valid && priceRef != null && stopHit(priceRef, { isLong: position.isLong, stopPrice, exit });
 
   const warn = !valid
     ? null
-    : beyondBust
-      ? t("trig.warn.bustFirst", { bust: fmtPrice(position.bustPrice) })
-      : priceRef != null && Math.abs(stopPrice - position.bustPrice) / priceRef < STOP_BUST_MIN_BUFFER
-        ? t("trig.warn.bustBuffer")
-        : Math.abs(stopPrice - position.bustPrice) <=
-            0.1 * Math.abs(position.entryPrice - position.bustPrice)
-          ? t("trig.warn.bustClose")
-          : pastMarket
-            ? t("trig.warn.pastMarket")
-            : null;
+    : isTp
+      ? wrongSide
+        ? t("trig.warn.tpWrongSide", { entry: fmtPrice(position.entryPrice) })
+        : pastMarket
+          ? t("trig.warn.pastMarket")
+          : null
+      : beyondBust
+        ? t("trig.warn.bustFirst", { bust: fmtPrice(position.bustPrice) })
+        : priceRef != null && Math.abs(stopPrice - position.bustPrice) / priceRef < STOP_BUST_MIN_BUFFER
+          ? t("trig.warn.bustBuffer")
+          : Math.abs(stopPrice - position.bustPrice) <= 0.1 * Math.abs(position.entryPrice - position.bustPrice)
+            ? t("trig.warn.bustClose")
+            : pastMarket
+              ? t("trig.warn.pastMarket")
+              : null;
 
   const arm = () => {
     if (!valid) return;
@@ -210,22 +231,23 @@ export function StopCell({
       onNote(pastMarket ? t("trig.confirmPast") : warn);
       return;
     }
-    const loss = pnlAt(position, stopPrice);
+    const pnl = pnlAt(position, stopPrice);
     void store
       .armStop({
         positionId: position.positionId,
         instrumentId: position.instrumentId,
         isLong: position.isLong,
         stopPrice,
+        ...(isTp ? { exit: "tp" as const } : {}),
       })
       .then((r) =>
         onNote(
           r.ok
-            ? t("trig.noticeArmed", {
+            ? t(isTp ? "trig.noticeTpArmed" : "trig.noticeArmed", {
                 market: symbolOf(position.instrumentId),
-                cmp: stopCmp(position.isLong),
+                cmp: stopCmp(position.isLong, exit),
                 price: fmtPrice(stopPrice),
-                pnl: `${loss >= 0 ? "+" : "−"}${fmtUsd(Math.abs(loss))}`,
+                pnl: signed(pnl),
               })
             : apiErrorText(t, r)
         )
@@ -244,9 +266,9 @@ export function StopCell({
         step="any"
         autoFocus
         className={warn ? "warn-input" : undefined}
-        title={warn ?? t("trig.closesEntire")}
-        aria-label={t("trig.stopPrice")}
-        placeholder={t("trig.stopPrice")}
+        title={warn ?? t(isTp ? "trig.tpClosesEntire" : "trig.closesEntire")}
+        aria-label={t(isTp ? "trig.tpPrice" : "trig.stopPrice")}
+        placeholder={t(isTp ? "trig.tpPrice" : "trig.stopPrice")}
         value={text}
         onChange={(e) => {
           setText(e.target.value);
@@ -279,33 +301,40 @@ export function StopCell({
   );
 }
 
-/** "−2 %" or "≤ 80,000" — how an attached stop reads in a cell */
-function attachedStopText(a: AttachedStop, isLong: boolean): string {
-  return a.mode === "pct" ? `−${(a.value * 100).toFixed(a.value * 100 < 1 ? 2 : 1).replace(/\.0$/, "")} %` : `${stopCmp(isLong)} ${fmtPrice(a.value)}`;
+/** "−2 %" / "+4 %" or "≤ 80,000" — how an attached exit reads in a cell */
+function attachedStopText(a: AttachedStop, isLong: boolean, exit: ExitKind = "stop"): string {
+  return a.mode === "pct"
+    ? `${exit === "tp" ? "+" : "−"}${(a.value * 100).toFixed(a.value * 100 < 1 ? 2 : 1).replace(/\.0$/, "")} %`
+    : `${stopCmp(isLong, exit)} ${fmtPrice(a.value)}`;
 }
 
+/** default % offsets for a fresh attached exit: 2 % stop, 4 % take-profit (a 2R bracket) */
+const DEFAULT_PCT: Record<ExitKind, string> = { stop: "2", tp: "4" };
+
 /**
- * The stop a WAITING entry will get the moment it fills. Same shape as
- * StopCell, but nothing exists on-chain yet: the server stores the intent
- * (% from fill or fixed price) and spawns the real stop at execution.
+ * The stop / take-profit a WAITING entry will get the moment it fills. Same
+ * shape as StopCell, but nothing exists on-chain yet: the server stores the
+ * intent (% from fill or fixed price) and spawns the real exit at execution.
  */
-function EntryStopCell({ store, entry, onNote }: { store: TriggerStore; entry: TriggerEntry; onNote: (msg: string) => void }) {
+function EntryStopCell({ store, entry, onNote, which = "stop" }: { store: TriggerStore; entry: TriggerEntry; onNote: (msg: string) => void; which?: ExitKind }) {
   const { t } = useI18n();
+  const isTp = which === "tp";
+  const a = (isTp ? entry.attachedTp : entry.attachedStop) ?? null;
   const [open, setOpen] = useState(false);
-  const [mode, setMode] = useState<"pct" | "price">(entry.attachedStop?.mode ?? "pct");
+  const [mode, setMode] = useState<"pct" | "price">(a?.mode ?? "pct");
   const [text, setText] = useState("");
   const report = (p: Promise<ApiResult>) =>
     p.then((r) => {
       if (!r.ok) onNote(apiErrorText(t, r));
     });
   const editable = entry.status === "armed" || entry.status === "confirming" || entry.status === "attention";
-  const a = entry.attachedStop ?? null;
+  const levelOf = (x: AttachedStop) => (isTp ? attachedTpLevel(x, entry.isLong, entry.triggerPrice) : attachedStopLevel(x, entry.isLong, entry.triggerPrice));
 
   if (!editable) {
     // fired / queued: the server will spawn it at the fill; nothing to edit any more
     return a ? (
-      <span className="stopcell" title={t("trig.stopOnFillPending")}>
-        <b className="stop-at muted">{attachedStopText(a, entry.isLong)}</b>
+      <span className="stopcell" title={t(isTp ? "trig.tpOnFillPending" : "trig.stopOnFillPending")}>
+        <b className="stop-at muted">{attachedStopText(a, entry.isLong, which)}</b>
       </span>
     ) : null;
   }
@@ -314,32 +343,32 @@ function EntryStopCell({ store, entry, onNote }: { store: TriggerStore; entry: T
     return a ? (
       <span className="stopcell">
         <b
-          className="stop-at"
-          title={t("trig.stopOnFillLine", { level: fmtPrice(attachedStopLevel(a, entry.isLong, entry.triggerPrice)) })}
+          className={isTp ? "stop-at tp-at" : "stop-at"}
+          title={t(isTp ? "trig.tpOnFillLine" : "trig.stopOnFillLine", { level: fmtPrice(levelOf(a)) })}
           onClick={() => {
             setMode(a.mode);
             setText(a.mode === "pct" ? String(Math.round(a.value * 10000) / 100) : String(a.value));
             setOpen(true);
           }}
         >
-          {attachedStopText(a, entry.isLong)}
+          {attachedStopText(a, entry.isLong, which)}
         </b>
-        <button className="xbtn" title={t("trig.cancel")} onClick={() => report(store.setEntryStop(entry.id, null))}>
+        <button className="xbtn" title={t("trig.cancel")} onClick={() => report(store.setEntryStop(entry.id, null, which))}>
           ×
         </button>
       </span>
     ) : (
       <span className="stopcell">
         <button
-          className="addstop"
-          title={t("ticket.stopOnFillWhy")}
+          className={isTp ? "addstop addtp" : "addstop"}
+          title={t(isTp ? "ticket.tpOnFillWhy" : "ticket.stopOnFillWhy")}
           onClick={() => {
             setMode("pct");
-            setText("2");
+            setText(DEFAULT_PCT[which]);
             setOpen(true);
           }}
         >
-          {t("trig.addStop")}
+          {t(isTp ? "trig.addTp" : "trig.addStop")}
         </button>
       </span>
     );
@@ -348,17 +377,18 @@ function EntryStopCell({ store, entry, onNote }: { store: TriggerStore; entry: T
   const n = Number(text);
   const typed = text.trim() !== "" && Number.isFinite(n) && n > 0;
   const next: AttachedStop | null = typed ? { mode, value: mode === "pct" ? n / 100 : n } : null;
-  const problem = next ? attachedStopProblem(next, entry) : null;
-  const warn = problem === "wrong-side" ? t("ticket.p.stopWrongSide") : problem === "beyond-bust" ? t("ticket.p.stopBeyondBust") : null;
+  const problem = next ? (isTp ? attachedTpProblem(next, entry) : attachedStopProblem(next, entry)) : null;
+  const warn =
+    problem === "wrong-side" ? t(isTp ? "ticket.p.tpWrongSide" : "ticket.p.stopWrongSide") : problem === "beyond-bust" ? t("ticket.p.stopBeyondBust") : null;
   const close = () => {
     setOpen(false);
     setText("");
   };
   const save = () => {
     if (!next || warn) return;
-    void store.setEntryStop(entry.id, next).then((r) => {
+    void store.setEntryStop(entry.id, next, which).then((r) => {
       if (!r.ok) onNote(apiErrorText(t, r));
-      else onNote(t("trig.stopOnFillSet", { level: fmtPrice(attachedStopLevel(next, entry.isLong, entry.triggerPrice)) }));
+      else onNote(t(isTp ? "trig.tpOnFillSet" : "trig.stopOnFillSet", { level: fmtPrice(levelOf(next)) }));
     });
     close();
   };
@@ -371,11 +401,12 @@ function EntryStopCell({ store, entry, onNote }: { store: TriggerStore; entry: T
         onClick={() => {
           // flipping the unit converts the current value instead of leaving "2" to be read as $2
           if (mode === "pct") {
-            const pct = typed ? n / 100 : 0.02;
-            setText(String(Math.round(entry.triggerPrice * (entry.isLong ? 1 - pct : 1 + pct) * 10) / 10));
+            const pct = typed ? n / 100 : Number(DEFAULT_PCT[which]) / 100;
+            const adverse = entry.isLong !== isTp; // stop on a long / TP on a short sit below the trigger
+            setText(String(Math.round(entry.triggerPrice * (adverse ? 1 - pct : 1 + pct) * 10) / 10));
             setMode("price");
           } else {
-            setText("2");
+            setText(DEFAULT_PCT[which]);
             setMode("pct");
           }
         }}
@@ -389,9 +420,9 @@ function EntryStopCell({ store, entry, onNote }: { store: TriggerStore; entry: T
         step="any"
         autoFocus
         className={warn ? "warn-input" : undefined}
-        title={warn ?? t("ticket.stopOnFillWhy")}
-        aria-label={t("ticket.stopOnFill")}
-        placeholder={mode === "pct" ? "2" : t("trig.stopPrice")}
+        title={warn ?? t(isTp ? "ticket.tpOnFillWhy" : "ticket.stopOnFillWhy")}
+        aria-label={t(isTp ? "ticket.tpOnFill" : "ticket.stopOnFill")}
+        placeholder={mode === "pct" ? DEFAULT_PCT[which] : t(isTp ? "trig.tpPrice" : "trig.stopPrice")}
         value={text}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
@@ -454,7 +485,7 @@ function OrderRow({
   const item = row.item;
   const live = isLive(item.status);
   const level = isEntry ? (item as TriggerEntry).triggerPrice : (item as StopLoss).stopPrice;
-  const cmp = isEntry ? cmpOf((item as TriggerEntry).cross) : stopCmp((item as StopLoss).isLong);
+  const cmp = isEntry ? cmpOf((item as TriggerEntry).cross) : stopCmp((item as StopLoss).isLong, exitOf(item as StopLoss));
   const price = samples[item.instrumentId]?.price ?? marks[item.instrumentId];
   const distance = price != null && level > 0 ? ((price - level) / price) * 100 : null;
 
@@ -502,9 +533,7 @@ function OrderRow({
           {t(item.isLong ? "house.long" : "house.short").toUpperCase()}
         </i>
       </span>
-      <span className={isEntry ? "muted" : "trig-type-stop"}>
-        {t(isEntry ? "trig.type.entry" : "trig.type.stop")}
-      </span>
+      <span className={typeClass(item, isEntry)}>{t(typeKey(item, isEntry))}</span>
       <span>
         {cmp} {fmtPrice(level)}
       </span>
@@ -524,7 +553,8 @@ function OrderRow({
         {(err || note) && <em className={err ? "trig-err" : "muted"}> {err ?? note}</em>}
       </span>
       <span className="trig-actions">
-        {entry && <EntryStopCell store={store} entry={entry} onNote={onNote} />}
+        {entry && <EntryStopCell store={store} entry={entry} onNote={onNote} which="stop" />}
+        {entry && <EntryStopCell store={store} entry={entry} onNote={onNote} which="tp" />}
         {live && (
           <button className="close-btn" onClick={() => report(store.cancel(item.id))}>
             {t("trig.cancel")}
@@ -875,18 +905,22 @@ export function TriggerHistory({ store, closedPnl }: { store: TriggerStore | nul
         const entry = isEntry ? (item as TriggerEntry) : null;
         const stop = isEntry ? null : (item as StopLoss);
         const level = entry ? entry.triggerPrice : stop!.stopPrice;
-        const cmp = entry ? cmpOf(entry.cross) : stopCmp(stop!.isLong);
+        const cmp = entry ? cmpOf(entry.cross) : stopCmp(stop!.isLong, exitOf(stop!));
         const when = item.firedAt ?? item.createdAt;
         const err = item.status === "failed" ? errText(t, item.error) : null;
-        // what became of the stop the entry asked for
-        const spawnNote =
-          entry?.attachedStop && (entry.status === "executed" || entry.status === "unreconciled")
+        // what became of the stop / take-profit the entry asked for
+        const filled = entry?.status === "executed" || entry?.status === "unreconciled";
+        const stopNote =
+          entry?.attachedStop && filled
             ? entry.spawnedStopId
               ? entry.spawnNote === "clamped"
                 ? t("trig.spawnedClamped")
                 : t("trig.spawnedStop")
               : t("trig.spawnFailed")
             : null;
+        const tpNote = entry?.attachedTp && filled ? (entry.spawnedTpId ? t("trig.spawnedTp") : t("trig.spawnTpFailed")) : null;
+        const spawnNote = [stopNote, tpNote].filter(Boolean).join(" · ") || null;
+        const spawnOk = (!entry?.attachedStop || !!entry.spawnedStopId) && (!entry?.attachedTp || !!entry.spawnedTpId);
         const fill =
           entry?.status === "executed" && entry.executedPrice != null ? (
             <>
@@ -913,7 +947,7 @@ export function TriggerHistory({ store, closedPnl }: { store: TriggerStore | nul
                 {t(item.isLong ? "house.long" : "house.short").toUpperCase()}
               </i>
             </span>
-            <span className={isEntry ? "muted" : "trig-type-stop"}>{t(isEntry ? "trig.type.entry" : "trig.type.stop")}</span>
+            <span className={typeClass(item, isEntry)}>{t(typeKey(item, isEntry))}</span>
             <span>
               {cmp} {fmtPrice(level)}
             </span>
@@ -922,7 +956,7 @@ export function TriggerHistory({ store, closedPnl }: { store: TriggerStore | nul
             <span>
               <Chip status={item.status} />
               {err && <em className="trig-err"> {err}</em>}
-              {spawnNote && <em className={entry?.spawnedStopId ? "muted" : "trig-err"}> {spawnNote}</em>}
+              {spawnNote && <em className={spawnOk ? "muted" : "trig-err"}> {spawnNote}</em>}
             </span>
             <span className="muted" title={new Date(when).toLocaleString()}>
               {timeAgo(when)}

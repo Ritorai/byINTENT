@@ -25,7 +25,7 @@ import { fetchMarketStats, fetchTradingState, fmtPrice, fmtUsd, type TradingStat
 import { cssVar, useTheme } from "./theme";
 import Ticket from "./Ticket";
 import TradeBar from "./TradeBar";
-import { TRIGGER_ERROR_KEYS, attachedStopLevel } from "../shared/triggerLogic";
+import { TRIGGER_ERROR_KEYS, attachedStopLevel, attachedTpLevel, exitOf } from "../shared/triggerLogic";
 import { RemoteTriggerStore, type ApiResult, type ArmEntrySpec, type PriceSample, type TriggerEntry, type TriggerEvent } from "./triggerApi";
 import { useCandleHistory } from "./useCandles";
 import { ConnectControls } from "./wallet";
@@ -396,10 +396,12 @@ export default function App() {
         lines.push({ id: e.id, kind: "entry", price: e.triggerPrice, isLong: e.isLong, leverage: e.leverage, pending: pendingOf(e.status), attention: e.status === "attention" });
         if (e.attachedStop && !pendingOf(e.status))
           lines.push({ id: `${e.id}:stop`, kind: "stop", price: attachedStopLevel(e.attachedStop, e.isLong, e.triggerPrice), isLong: e.isLong, ghost: true });
+        if (e.attachedTp && !pendingOf(e.status))
+          lines.push({ id: `${e.id}:tp`, kind: "tp", price: attachedTpLevel(e.attachedTp, e.isLong, e.triggerPrice), isLong: e.isLong, ghost: true });
       }
       for (const s of trigStore.stops) {
         if (s.instrumentId !== mid || !(s.status === "armed" || s.status === "confirming" || s.status === "attention" || pendingOf(s.status))) continue;
-        lines.push({ id: s.id, kind: "stop", price: s.stopPrice, isLong: s.isLong, pending: pendingOf(s.status), attention: s.status === "attention" });
+        lines.push({ id: s.id, kind: exitOf(s), price: s.stopPrice, isLong: s.isLong, pending: pendingOf(s.status), attention: s.status === "attention" });
       }
     }
     chartState.current.triggers = lines;
@@ -480,17 +482,17 @@ export default function App() {
         case "entry-unreconciled":
           return t("trig.notice.unreconciled");
         case "stop-queued":
-          return t("trig.notice.stopQueued", { market: trigSymbol(ev.stop.instrumentId) });
+          return t(exitOf(ev.stop) === "tp" ? "trig.notice.tpQueued" : "trig.notice.stopQueued", { market: trigSymbol(ev.stop.instrumentId) });
         case "stop-failed":
-          return t("trig.notice.stopFailed", { market: trigSymbol(ev.stop.instrumentId), error: errOf(ev.stop.error) });
+          return t(exitOf(ev.stop) === "tp" ? "trig.notice.tpFailed" : "trig.notice.stopFailed", { market: trigSymbol(ev.stop.instrumentId), error: errOf(ev.stop.error) });
         case "stop-executed":
-          return t("trig.notice.stopExecuted", { market: trigSymbol(ev.stop.instrumentId) });
+          return t(exitOf(ev.stop) === "tp" ? "trig.notice.tpExecuted" : "trig.notice.stopExecuted", { market: trigSymbol(ev.stop.instrumentId) });
         case "stop-unknown":
-          return t("trig.notice.stopUnknown", { market: trigSymbol(ev.stop.instrumentId) });
+          return t(exitOf(ev.stop) === "tp" ? "trig.notice.tpUnknown" : "trig.notice.stopUnknown", { market: trigSymbol(ev.stop.instrumentId) });
         case "stop-expired":
-          return t("trig.notice.stopExpired", { market: trigSymbol(ev.stop.instrumentId) });
+          return t(exitOf(ev.stop) === "tp" ? "trig.notice.tpExpired" : "trig.notice.stopExpired", { market: trigSymbol(ev.stop.instrumentId) });
         case "stop-done":
-          return t("trig.notice.stopDone", { market: trigSymbol(ev.stop.instrumentId) });
+          return t(exitOf(ev.stop) === "tp" ? "trig.notice.tpDone" : "trig.notice.stopDone", { market: trigSymbol(ev.stop.instrumentId) });
       }
     },
     [t]

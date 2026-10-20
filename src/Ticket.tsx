@@ -27,7 +27,7 @@ import {
   sessionStatus,
 } from "./session";
 import type { ApiResult, ArmEntrySpec, AttachedStop, CrossDirection, RemoteTriggerStore } from "./triggerApi";
-import { attachedStopLevel, attachedStopProblem } from "../shared/triggerLogic";
+import { attachedStopLevel, attachedStopProblem, attachedTpLevel, attachedTpProblem } from "../shared/triggerLogic";
 import { TriggerSetupModal, apiErrorText, isUserRejection, triggerPhase, useNowTick } from "./TriggerSetup";
 
 interface TicketProps {
@@ -95,6 +95,8 @@ export default function Ticket({
   // a % distance from the fill (default) or a fixed price
   const [stopMode, setStopMode] = useState<"off" | "pct" | "price">("off");
   const [stopText, setStopText] = useState("");
+  const [tpMode, setTpMode] = useState<"off" | "pct" | "price">("off");
+  const [tpText, setTpText] = useState("");
   // enabling triggers: the explainer modal, then the registration signature — both off the big button
   const [setupOpen, setSetupOpen] = useState(false);
   const [regBusy, setRegBusy] = useState(false);
@@ -235,6 +237,30 @@ export default function Ticket({
         })()
       : null;
 
+  // attached take-profit: the favourable twin of the stop. No bust bound on this
+  // side; the only thing that can be wrong is a fixed level on the loss side.
+  const tpNum = Number(tpText);
+  const tpTyped = tpText.trim() !== "" && Number.isFinite(tpNum) && tpNum > 0;
+  const attachedTp: AttachedStop | null =
+    mode === "trigger" && tpMode !== "off" && tpTyped ? { mode: tpMode, value: tpMode === "pct" ? tpNum / 100 : tpNum } : null;
+  const tpProblem =
+    mode !== "trigger" || tpMode === "off"
+      ? null
+      : !tpTyped
+        ? t("ticket.p.enterTp")
+        : attachedTp && triggerValid && attachedTpProblem(attachedTp, { isLong, triggerPrice })
+          ? t("ticket.p.tpWrongSide")
+          : null;
+  const tpEstimate =
+    attachedTp && triggerValid && !tpProblem
+      ? (() => {
+          const level = attachedTpLevel(attachedTp, isLong, triggerPrice);
+          const frac = Math.abs(level - triggerPrice) / triggerPrice;
+          const gain = margin * leverage * frac;
+          return { level, gain, pctOfMargin: (gain / Math.max(margin, 1e-9)) * 100 };
+        })()
+      : null;
+
   // ---- chart preview: visible while the pointer is over the ticket or a field is focused ----
   // Hover is tracked at document level (not just enter/leave) so a tap, a click
   // elsewhere or the cursor leaving the window can never leave it stuck on.
@@ -307,7 +333,7 @@ export default function Ticket({
 
   /** Arm a server-side trigger entry — the watcher evaluates and fires it (triggerApi.ts). */
   const doArm = async () => {
-    if (!address || problem || triggerProblem || stopProblem || !onArmEntry) return;
+    if (!address || problem || triggerProblem || stopProblem || tpProblem || !onArmEntry) return;
     setBusy(true);
     setMsg(null);
     try {
@@ -321,6 +347,7 @@ export default function Ticket({
         cross: triggerCross,
         expiresAt: expiry === "never" ? null : Date.now() + EXPIRY_MS[expiry],
         attachedStop,
+        attachedTp,
       });
       if (!r.ok) {
         setMsg(apiErrorText(t, r));
@@ -375,6 +402,9 @@ export default function Ticket({
   const liqDistPct = refPrice && liq ? (Math.abs(refPrice - liq) / refPrice) * 100 : null;
   // Without a stop the whole isolated margin is at risk; with a stop on fill, the estimated loss there.
   const maxLoss = marginValid ? (stopEstimate ? stopEstimate.loss : margin) : null;
+  // reward at the take-profit and the resulting R multiple against the max loss
+  const reward = marginValid && tpEstimate ? tpEstimate.gain : null;
+  const rMultiple = reward != null && maxLoss != null && maxLoss > 0 ? reward / maxLoss : null;
   const sizePctOfFree = snapshot && marginValid && limit.maximum > 0 ? Math.min(100, (margin / limit.maximum) * 100) : null;
   const ctaLabel =
     mode === "trigger"
@@ -600,6 +630,52 @@ export default function Ticket({
 
             <div className="fld">
               <div className="fld-head">
+                <label htmlFor="trig-tp-in" title={t("ticket.tpOnFillWhy")}>
+                  {t("ticket.tpOnFill")}
+                </label>
+                <div className="seg seg-mini" role="tablist">
+                  {(["off", "pct", "price"] as const).map((x) => (
+                    <button
+                      key={x}
+                      role="tab"
+                      className={tpMode === x ? "on" : ""}
+                      aria-selected={tpMode === x}
+                      onClick={() => {
+                        setTpMode(x);
+                        // same conversion as the stop, mirrored: a fixed price starts from the trigger plus the typed %
+                        if (x === "price" && (tpText.trim() === "" || tpMode === "pct") && triggerValid) {
+                          const typedPct = Number(tpText);
+                          const pct = tpMode === "pct" && Number.isFinite(typedPct) && typedPct > 0 ? typedPct / 100 : 0.04;
+                          setTpText(String(Math.round(triggerPrice * (isLong ? 1 + pct : 1 - pct) * 10) / 10));
+                        }
+                        if (x === "pct" && (tpText.trim() === "" || tpMode === "price")) setTpText("4");
+                        if (x === "off") setTpText("");
+                      }}
+                    >
+                      {x === "off" ? t("ticket.stopOff") : x === "pct" ? "%" : "$"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {tpMode !== "off" && (
+                <div className={tpProblem && tpTyped ? "fld-in warn" : "fld-in"}>
+                  <input
+                    id="trig-tp-in"
+                    type="number"
+                    inputMode="decimal"
+                    min={0}
+                    step="any"
+                    placeholder={tpMode === "pct" ? "4" : t("trig.tpPrice")}
+                    value={tpText}
+                    onChange={(e) => setTpText(e.target.value)}
+                  />
+                  <span className="fld-unit">{tpMode === "pct" ? "%" : "USD"}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="fld">
+              <div className="fld-head">
                 <label>{t("ticket.expiry")}</label>
                 <div className="seg seg-mini" role="tablist">
                   {(["1h", "24h", "7d", "never"] as const).map((x) => (
@@ -612,6 +688,7 @@ export default function Ticket({
             </div>
 
             {stopProblem && stopTyped && <div className="hint small warn-text">{stopProblem}</div>}
+            {tpProblem && tpTyped && <div className="hint small warn-text">{tpProblem}</div>}
             {triggerAlreadyPast && <div className="hint small warn-text">{t("ticket.trigAlreadyPast")}</div>}
           </>
         )}
@@ -656,6 +733,18 @@ export default function Ticket({
               )}
             </b>
           </div>
+          {reward != null && (
+            <div className="kv">
+              <span>{t("ticket.reward")}</span>
+              <b className="numeric up">
+                +{fmtUsd(reward)}{" "}
+                <i>
+                  {t("ticket.atTp")}
+                  {rMultiple != null ? ` · ${rMultiple.toFixed(rMultiple < 10 ? 1 : 0)}R` : ""}
+                </i>
+              </b>
+            </div>
+          )}
         </div>
 
         {/* gated CTA */}
@@ -694,10 +783,10 @@ export default function Ticket({
           ) : (
             <button
               className={`gobtn ${sideClass}`}
-              disabled={busy || !!problem || !!triggerProblem || !!stopProblem}
+              disabled={busy || !!problem || !!triggerProblem || !!stopProblem || !!tpProblem}
               onClick={() => void doArm()}
             >
-              {busy ? t("ticket.submitting") : problem ?? triggerProblem ?? stopProblem ?? ctaLabel}
+              {busy ? t("ticket.submitting") : problem ?? triggerProblem ?? stopProblem ?? tpProblem ?? ctaLabel}
             </button>
           )
         ) : session.state === "none" || session.state === "expired" ? (

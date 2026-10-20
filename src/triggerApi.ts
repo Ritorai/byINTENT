@@ -12,10 +12,11 @@
 // browser never sees.
 
 import type { WalletClient } from "viem";
-import type { ArmEntrySpec, ArmStopSpec, AttachedStop, StopLoss, TriggerEntry, TriggerStatus } from "../shared/triggerLogic";
+import type { ArmEntrySpec, ArmStopSpec, AttachedStop, ExitKind, StopLoss, TriggerEntry, TriggerStatus } from "../shared/triggerLogic";
+import { exitOf } from "../shared/triggerLogic";
 import { registerSessionKey } from "./session";
 
-export type { ArmEntrySpec, ArmStopSpec, AttachedStop, CrossDirection, PriceSample, StopLoss, TriggerEntry, TriggerStatus } from "../shared/triggerLogic";
+export type { ArmEntrySpec, ArmStopSpec, AttachedStop, CrossDirection, ExitKind, PriceSample, StopLoss, TriggerEntry, TriggerStatus } from "../shared/triggerLogic";
 
 export interface KeyInfo {
   address: string;
@@ -161,8 +162,11 @@ export class RemoteTriggerStore {
     for (const l of this.listeners) l();
   }
 
-  stopFor(positionId: string): StopLoss | undefined {
-    return this.stops.find((s) => s.positionId === positionId && s.status !== "cancelled" && s.status !== "done" && s.status !== "executed" && s.status !== "failed" && s.status !== "expired");
+  /** the live stop (default) or take-profit on a position */
+  stopFor(positionId: string, exit: ExitKind = "stop"): StopLoss | undefined {
+    return this.stops.find(
+      (s) => s.positionId === positionId && exitOf(s) === exit && s.status !== "cancelled" && s.status !== "done" && s.status !== "executed" && s.status !== "failed" && s.status !== "expired"
+    );
   }
 
   // ---- lifecycle --------------------------------------------------------------------
@@ -386,9 +390,9 @@ export class RemoteTriggerStore {
   armEntry(spec: ArmEntrySpec): Promise<ApiResult<TriggerEntry>> {
     return this.mutate<TriggerEntry>("/api/triggers/entry", spec);
   }
-  /** set / replace / clear the stop a waiting entry spawns when it fills */
-  setEntryStop(id: string, stop: AttachedStop | null): Promise<ApiResult<TriggerEntry>> {
-    return this.mutate<TriggerEntry>(`/api/triggers/${encodeURIComponent(id)}/stop`, { stop });
+  /** set / replace / clear the stop (or take-profit) a waiting entry spawns when it fills */
+  setEntryStop(id: string, stop: AttachedStop | null, which: ExitKind = "stop"): Promise<ApiResult<TriggerEntry>> {
+    return this.mutate<TriggerEntry>(`/api/triggers/${encodeURIComponent(id)}/stop`, { stop, which });
   }
   armStop(spec: ArmStopSpec): Promise<ApiResult<StopLoss>> {
     return this.mutate<StopLoss>("/api/triggers/stop", spec);

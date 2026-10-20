@@ -166,8 +166,9 @@ All JSON, all under `/api`. Errors: `{error: code, message?}`.
 | `POST /api/watcher/key/registered` | cookie | `{intentId}` advisory; activation is on-chain |
 | `POST /api/watcher/key/revoke` | cookie | → `{keyAddress}` (for the on-chain tx) |
 | `GET  /api/triggers` | cookie | → `{version, enabled, entries[], stops[]}` |
-| `POST /api/triggers/entry` | cookie | `ArmEntrySpec` → `TriggerEntry` |
-| `POST /api/triggers/stop` | cookie | `ArmStopSpec` → `StopLoss` (supersedes the live stop on that position) |
+| `POST /api/triggers/entry` | cookie | `ArmEntrySpec` (incl. optional `attachedStop` / `attachedTp`) → `TriggerEntry` |
+| `POST /api/triggers/stop` | cookie | `ArmStopSpec` (`exit?: "stop" \| "tp"`, default stop) → `StopLoss` (supersedes the live exit *of that kind* on that position) |
+| `POST /api/triggers/:id/stop` | cookie | `{stop: AttachedStop \| null, which?: "stop" \| "tp"}` sets / clears the exit a waiting entry spawns on fill |
 | `POST /api/triggers/:id/cancel` | cookie | armed/confirming/attention → cancelled |
 | `POST /api/triggers/:id/rearm` | cookie | attention → armed (re-baselines) |
 | `POST /api/triggers/:id/cancel-queued` | cookie | asks the watcher to `cancelIntent` the fired intent |
@@ -188,6 +189,18 @@ trusts (`shared/triggerLogic.ts`).
 The `TriggerEntry` / `StopLoss` shapes and the status vocabulary are unchanged
 from the client engine, so the Orders tab and the STOP cell needed no new
 states.
+
+**Take-profit.** A TP is a `StopLoss` row with `data.exit = "tp"` — same
+`kind = 'stop'` in the table (the CHECK constraint is untouched), same
+evaluate / CAS-fire / `close` / reconcile path, mirrored hit test
+(`stopHit`: long fires at/above the level, short at/below). Rows without
+`exit` mean stop. A position may carry one live stop and one live TP; arming a
+new one of a kind supersedes only that kind. A TP has no bust clamp (there is
+nothing to clamp against on the profit side); its only validation is that a
+fixed level sits on the profit side of the trigger / entry. On fill, an entry
+spawns its `attachedStop` and `attachedTp` in the same transaction as its own
+`executed` write (`updateTriggerAndSpawn(rec, spawns[])`), so a bracket is
+either fully armed or not written at all.
 
 ## 6. Engine
 

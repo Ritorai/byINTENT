@@ -318,6 +318,33 @@ const en = {
 
   "trig.spawnFailed": "stop NOT created — add one in Positions",
 
+  // take-profit — the favourable twin of the stop. Same market close of the whole position, mirrored side.
+  "tb.tpCol": "TP",
+  "ticket.tpOnFill": "Take profit on fill",
+  "ticket.tpOnFillWhy": "Optional. The moment this trigger fills, the watcher arms a take-profit on the new position — a % above your fill price (below for shorts) or a fixed price. It fires a market close when price reaches the level. You can change it in the Triggers tab while the trigger waits.",
+  "ticket.p.enterTp": "Enter a take profit",
+  "ticket.p.tpWrongSide": "Take profit must be on the profit side of the trigger",
+  "ticket.reward": "Reward",
+  "ticket.atTp": "at TP",
+  "trig.tpPrice": "TP price",
+  "trig.addTp": "+ TP",
+  "trig.type.tp": "Take profit",
+  "trig.tpClosesEntire": "A take-profit closes the ENTIRE position at market when price reaches the level — the protocol has no partial close.",
+  "trig.gainAtTp": "Est. at TP: {pnl} ({pct}% of margin) — market fill, the level is not guaranteed",
+  "trig.noticeTpArmed": "Take profit armed — {market} closes at {cmp} ${price} (est. {pnl}).",
+  "trig.warn.tpWrongSide": "This is on the loss side of your entry (${entry}) — it would lock in a loss, not take a profit.",
+  "trig.tpOnFillLine": "Take-profit the watcher will arm at ≈ ${level} the moment this entry fills. Click to change, × to remove.",
+  "trig.tpOnFillPending": "Fired — the take-profit is created when the fill lands.",
+  "trig.tpOnFillSet": "Take profit on fill set — ≈ ${level} once the entry executes.",
+  "trig.spawnedTp": "take-profit armed on the position",
+  "trig.spawnTpFailed": "take-profit NOT created — add one in Positions",
+  "trig.notice.tpQueued": "Take profit hit — close queued for the {market} position.",
+  "trig.notice.tpExecuted": "Take profit executed — the {market} position is closed.",
+  "trig.notice.tpFailed": "Take-profit failed — {market}: {error}",
+  "trig.notice.tpDone": "Take-profit cleared — the {market} position was already closed.",
+  "trig.notice.tpUnknown": "Take-profit submission outcome UNKNOWN — {market}. Check the queue; do not assume the position is closed.",
+  "trig.notice.tpExpired": "Take-profit expired — the {market} position is still open; its queued close passed the deadline.",
+
   "trig.historyTitle": "Triggers",
 
   "trig.filled": "Filled",

@@ -231,6 +231,7 @@ export default function TradeBar({
             <span>{t("tb.risk")}</span>
             <span>{t("tb.margin")}</span>
             <span>{t("tb.stopCol")}</span>
+            <span>{t("tb.tpCol")}</span>
             <span>{t("tb.when")}</span>
             <span />
           </div>
@@ -258,6 +259,7 @@ export default function TradeBar({
                 <span>—</span>
                 <span>—</span>
                 <span>{op.amount != null ? op.amount.toFixed(2) : "—"}</span>
+                <span className="muted">—</span>
                 <span className="muted">—</span>
                 <span>{timeAgo(op.timeMs)}</span>
                 <span>
@@ -298,6 +300,16 @@ export default function TradeBar({
                     mark={mark}
                     livePrice={trigSamples[p.instrumentId]?.price}
                     onNote={onAction}
+                  />
+                </span>
+                <span>
+                  <StopCell
+                    store={trigStore}
+                    position={p}
+                    mark={mark}
+                    livePrice={trigSamples[p.instrumentId]?.price}
+                    onNote={onAction}
+                    exit="tp"
                   />
                 </span>
                 <span title={new Date(p.openedAtMs).toLocaleString()}>{timeAgo(p.openedAtMs)}</span>

@@ -1006,8 +1006,8 @@ input[type="number"] {
 
 .tb-row {
   display: grid;
-  /* market | size | entry | mark | pnl | liq | to liq | margin | stop | age | action */
-  grid-template-columns: 1.9fr 1fr 1fr 1fr 1.5fr 1fr 1.1fr 0.8fr 1.5fr 0.7fr 0.8fr;
+  /* market | size | entry | mark | pnl | liq | to liq | margin | stop | tp | age | action */
+  grid-template-columns: 1.9fr 1fr 1fr 1fr 1.5fr 1fr 1.1fr 0.8fr 1.5fr 1.5fr 0.7fr 0.8fr;
   gap: 10px;
   align-items: center;
   padding: 7px 4px;
@@ -1919,7 +1919,9 @@ input[type="number"] {
   .tradebar .tb-row:not(.tb-history) > :nth-child(4),
   .tradebar .tb-row:not(.tb-history) > :nth-child(7),
   .tradebar .tb-row:not(.tb-history) > :nth-child(8),
-  .tradebar .tb-row:not(.tb-history) > :nth-child(9) {
+  .tradebar .tb-row:not(.tb-history) > :nth-child(9),
+  .tradebar .tb-row:not(.tb-history) > :nth-child(10),
+  .tradebar .tb-row:not(.tb-history) > :nth-child(11) {
     display: none;
   }
 
@@ -1951,13 +1953,13 @@ input[type="number"] {
    every cell (same approach as the leaderboard table above). Stop stays — it
    is the one cell you reach for in a hurry. */
 @media (max-width: 1100px) {
-  /* positions: hide Notional (2) and When (10) */
+  /* positions: hide Size (2) and Age (11) */
   .tb-row.tb-pos {
-    grid-template-columns: 2.1fr 1fr 1fr 1.4fr 1fr 1.1fr 0.7fr 1.6fr 0.9fr;
+    grid-template-columns: 2.1fr 1fr 1fr 1.4fr 1fr 1.1fr 0.7fr 1.6fr 1.6fr 0.9fr;
   }
 
   .tb-row.tb-pos > span:nth-child(2),
-  .tb-row.tb-pos > span:nth-child(10) {
+  .tb-row.tb-pos > span:nth-child(11) {
     display: none;
   }
 
@@ -2036,6 +2038,12 @@ input[type="number"] {
 
 .trig-type-stop {
   color: var(--warning);
+  font-weight: 600;
+}
+
+.trig-type-tp,
+.stopcell .stop-at.tp-at {
+  color: var(--pos);
   font-weight: 600;
 }
 
@@ -2148,6 +2156,11 @@ input[type="number"] {
 .addstop.warn {
   color: var(--warning);
   border-color: var(--warning);
+}
+
+.addstop.addtp:hover:not(:disabled) {
+  color: var(--pos);
+  border-color: var(--pos);
 }
 
 .xbtn {

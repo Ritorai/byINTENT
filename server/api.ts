@@ -14,9 +14,12 @@ import {
   ADDRESS_RE,
   MAX_LIVE_TRIGGERS_PER_WALLET,
   attachedStopProblem,
+  attachedTpProblem,
+  exitOf,
   validateArmEntrySpec,
   validateArmStopSpec,
   validateAttachedStop,
+  validateAttachedTp,
   type StopLoss,
   type TriggerEntry,
 } from "../shared/triggerLogic";
@@ -233,25 +236,39 @@ export function mountTriggerApi(app: Express, deps: ApiDeps): void {
       crossSampleTs: null,
     };
     await repo.insertTrigger(rec);
-    await repo.audit({ at: now(), wallet: w, triggerId: rec.id, event: "arm.entry", detail: { instrumentId: spec.instrumentId, isLong: spec.isLong, marginUsdc: spec.marginUsdc, leverage: spec.leverage, triggerPrice: spec.triggerPrice, cross: spec.cross, attachedStop: spec.attachedStop ?? null } });
+    await repo.audit({ at: now(), wallet: w, triggerId: rec.id, event: "arm.entry", detail: { instrumentId: spec.instrumentId, isLong: spec.isLong, marginUsdc: spec.marginUsdc, leverage: spec.leverage, triggerPrice: spec.triggerPrice, cross: spec.cross, attachedStop: spec.attachedStop ?? null, attachedTp: spec.attachedTp ?? null } });
     res.status(201).json(publicRecord(rec));
   });
 
-  /** set / replace / clear the stop a waiting entry will spawn when it fills — body `{ stop: AttachedStop | null }` */
+  /**
+   * set / replace / clear the exit a waiting entry will spawn when it fills —
+   * body `{ stop: AttachedStop | null, which?: "stop" | "tp" }` (default stop)
+   */
   r.post("/triggers/:id/stop", requireAuth, requireMutation, limited(writeW, wallet), async (req, res) => {
     if (!idOk(req.params.id)) return err(res, 400, "bad_id");
     const w = wallet(req);
-    const stop = validateAttachedStop(req.body?.stop);
+    const which = req.body?.which;
+    if (!(which === undefined || which === "stop" || which === "tp")) return err(res, 400, "bad_spec");
+    const isTp = which === "tp";
+    const stop = isTp ? validateAttachedTp(req.body?.stop) : validateAttachedStop(req.body?.stop);
     if (stop === undefined) return err(res, 400, "bad_spec");
     const cur = await repo.getTrigger(w, req.params.id);
     if (!cur || cur.kind !== "entry") return err(res, 404, "not_found");
-    if (stop) {
+    if (stop && isTp) {
+      if (attachedTpProblem(stop, cur)) return err(res, 400, "bad_spec", "The take-profit must sit on the profit side of the trigger price.");
+    } else if (stop) {
       const problem = attachedStopProblem(stop, cur);
       if (problem) return err(res, 400, "bad_spec", problem === "wrong-side" ? "The stop must sit on the loss side of the trigger price." : "The stop would already be past the bust price.");
     }
-    const row = await repo.setAttachedStop(w, cur.id, stop);
+    const row = await repo.setAttachedStop(w, cur.id, stop, isTp ? "tp" : "stop");
     if (!row) return err(res, 404, "not_waiting");
-    await repo.audit({ at: now(), wallet: w, triggerId: row.id, event: stop ? "entry.stop.set" : "entry.stop.clear", detail: { attachedStop: stop } });
+    await repo.audit({
+      at: now(),
+      wallet: w,
+      triggerId: row.id,
+      event: isTp ? (stop ? "entry.tp.set" : "entry.tp.clear") : stop ? "entry.stop.set" : "entry.stop.clear",
+      detail: isTp ? { attachedTp: stop } : { attachedStop: stop },
+    });
     res.json(publicRecord(row));
   });
 
@@ -260,11 +277,12 @@ export function mountTriggerApi(app: Express, deps: ApiDeps): void {
     const spec = validateArmStopSpec(req.body, INSTRUMENTS);
     if (!spec) return err(res, 400, "bad_spec");
     if (!(await requireActiveKey(w, res))) return;
-    // one live stop per position: replacing an existing one must not be blocked by the cap
+    // one live stop and one live take-profit per position: replacing an existing one must not be blocked by the cap
+    const exit = exitOf(spec);
     const rows = await repo.listTriggersForWallet(w, 0);
-    const replacing = rows.filter((r) => r.kind === "stop" && r.positionId === spec.positionId && (r.status === "armed" || r.status === "confirming")).length;
+    const replacing = rows.filter((r) => r.kind === "stop" && r.positionId === spec.positionId && exitOf(r) === exit && (r.status === "armed" || r.status === "confirming")).length;
     if ((await repo.countLiveTriggers(w)) - replacing >= MAX_LIVE_TRIGGERS_PER_WALLET) return err(res, 409, "too_many_triggers");
-    await repo.supersedeLiveStops(w, spec.positionId);
+    await repo.supersedeLiveStops(w, spec.positionId, exit);
     const rec: TriggerRecord = {
       kind: "stop",
       version: 1,
@@ -278,7 +296,7 @@ export function mountTriggerApi(app: Express, deps: ApiDeps): void {
       absentEvals: 0,
     };
     await repo.insertTrigger(rec);
-    await repo.audit({ at: now(), wallet: w, triggerId: rec.id, event: "arm.stop", detail: { positionId: spec.positionId, instrumentId: spec.instrumentId, isLong: spec.isLong, stopPrice: spec.stopPrice } });
+    await repo.audit({ at: now(), wallet: w, triggerId: rec.id, event: "arm.stop", detail: { positionId: spec.positionId, instrumentId: spec.instrumentId, isLong: spec.isLong, stopPrice: spec.stopPrice, exit } });
     res.status(201).json(publicRecord(rec));
   });
 

@@ -1,11 +1,11 @@
 # byINTENT
 
-A minimal trading terminal for [papertrade](https://papertrade.xyz) (synthetic BTC/ETH perps on HyperEVM) that adds what the protocol does not have: **trigger orders and stop-losses that keep working with the tab closed**.
+A minimal trading terminal for [papertrade](https://papertrade.xyz) (synthetic BTC/ETH perps on HyperEVM) that adds what the protocol does not have: **trigger orders, stop-losses and take-profits that keep working with the tab closed**.
 
 One screen. Chart, ticket, positions. No gimmicks.
 
-- Market orders and **Trigger** orders (fire a market order when price crosses a level) with an optional **stop on fill**
-- Stop-losses on open positions, evaluated server-side
+- Market orders and **Trigger** orders (fire a market order when price crosses a level) with an optional **stop on fill** and **take profit on fill** — a full bracket armed the moment the entry lands
+- Stop-losses and take-profits on open positions, evaluated server-side (one live stop + one live TP per position; both are a market close of the whole position)
 - Chart with horizontal / trend lines, magnet, and a **LIQ tool** (click a price → the leverage that busts exactly there)
 - Dark and light theme, English only
 - The site never holds funds. Trades settle on-chain through papertrade's relayer and contracts.

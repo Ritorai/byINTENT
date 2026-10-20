@@ -73,18 +73,32 @@ export interface TriggerEntry {
   spawnedStopId?: string;
   /** how the spawned stop differed from what was asked */
   spawnNote?: "clamped";
+  /** take-profit to create for the position on fill (favourable side) */
+  attachedTp?: AttachedStop | null;
+  /** id of the TP row spawned from `attachedTp` */
+  spawnedTpId?: string;
 }
 
 /**
- * A stop that does not exist yet: it is created for the position a trigger
- * entry turns into. `pct` is the adverse distance from the FILL price as a
- * fraction (0.02 = 2 % — long: fill × 0.98, short: fill × 1.02); `price` is
- * a fixed level.
+ * An exit that does not exist yet: it is created for the position a trigger
+ * entry turns into. For a stop, `pct` is the ADVERSE distance from the FILL
+ * price as a fraction (0.02 = 2 % — long: fill × 0.98, short: fill × 1.02);
+ * for a take-profit it is the FAVOURABLE distance (long: fill × 1.02). `price`
+ * is a fixed level either way.
  */
 export interface AttachedStop {
   mode: "pct" | "price";
   value: number;
 }
+
+/**
+ * Which side of the position an exit sits on. A stop fires on the adverse side
+ * (long: price ≤ level), a take-profit on the favourable side (long: price ≥
+ * level). Both are a market close of the whole position; absent = "stop" so
+ * rows written before TP existed keep their meaning.
+ */
+export type ExitKind = "stop" | "tp";
+export const exitOf = (s: { exit?: ExitKind | null }): ExitKind => (s.exit === "tp" ? "tp" : "stop");
 
 export interface StopLoss {
   id: string;
@@ -93,6 +107,7 @@ export interface StopLoss {
   instrumentId: number;
   isLong: boolean;
   stopPrice: number;
+  exit?: ExitKind;
   status: TriggerStatus;
   createdAt: number;
   firedAt?: number;
@@ -130,6 +145,8 @@ export interface ArmEntrySpec {
   expiresAt: number | null;
   /** optional stop to spawn on fill (absent / null = none) */
   attachedStop?: AttachedStop | null;
+  /** optional take-profit to spawn on fill (absent / null = none) */
+  attachedTp?: AttachedStop | null;
 }
 
 export interface ArmStopSpec {
@@ -137,6 +154,8 @@ export interface ArmStopSpec {
   instrumentId: number;
   isLong: boolean;
   stopPrice: number;
+  /** absent = stop */
+  exit?: ExitKind;
 }
 
 /** One live price observation. `ts` is the feed's tick timestamp; `live`
@@ -220,9 +239,13 @@ export function crossed(prev: number | null | undefined, now: number, level: num
   return !pastLevel(prev, level, cross);
 }
 
-/** Stop-loss hit test: long stops fire at/below the stop, shorts at/above. */
-export function stopHit(price: number | null | undefined, stop: Pick<StopLoss, "isLong" | "stopPrice">): boolean {
+/**
+ * Exit hit test. Stop: long fires at/below the level, short at/above.
+ * Take-profit: the mirror — long at/above, short at/below.
+ */
+export function stopHit(price: number | null | undefined, stop: Pick<StopLoss, "isLong" | "stopPrice"> & { exit?: ExitKind | null }): boolean {
   if (price == null || !Number.isFinite(price)) return false;
+  if (exitOf(stop) === "tp") return stop.isLong ? price >= stop.stopPrice : price <= stop.stopPrice;
   return stop.isLong ? price <= stop.stopPrice : price >= stop.stopPrice;
 }
 
@@ -347,6 +370,9 @@ export function validateArmEntrySpec(x: unknown, instruments: InstrumentSet): Ar
   const attachedStop = validateAttachedStop(e.attachedStop);
   if (attachedStop === undefined) return null;
   if (attachedStop && attachedStopProblem(attachedStop, { isLong: e.isLong, leverage: e.leverage, triggerPrice: e.triggerPrice })) return null;
+  const attachedTp = validateAttachedTp(e.attachedTp);
+  if (attachedTp === undefined) return null;
+  if (attachedTp && attachedTpProblem(attachedTp, { isLong: e.isLong, triggerPrice: e.triggerPrice })) return null;
   return {
     instrumentId: e.instrumentId,
     isLong: e.isLong,
@@ -357,7 +383,43 @@ export function validateArmEntrySpec(x: unknown, instruments: InstrumentSet): Ar
     cross: e.cross,
     expiresAt: e.expiresAt as number | null,
     attachedStop,
+    attachedTp,
   };
+}
+
+/** absent/null → null (no TP); valid → the TP; anything else → undefined (reject). A TP % may exceed 50 % (no bust bound on the favourable side); 10× is the sanity cap. */
+export function validateAttachedTp(x: unknown): AttachedStop | null | undefined {
+  if (x == null) return null;
+  if (typeof x !== "object") return undefined;
+  const a = x as Record<string, unknown>;
+  if (a.mode === "pct") {
+    if (!isPosFinite(a.value) || a.value > 10) return undefined;
+    return { mode: "pct", value: a.value };
+  }
+  if (a.mode === "price") {
+    if (!isPosFinite(a.value) || a.value > 1e12) return undefined;
+    return { mode: "price", value: a.value };
+  }
+  return undefined;
+}
+
+/** Arm-time sanity of an attached take-profit: a fixed level must sit on the profit side of the trigger price. */
+export function attachedTpProblem(a: AttachedStop, entry: { isLong: boolean; triggerPrice: number }): "wrong-side" | null {
+  if (a.mode === "pct") return null;
+  return (entry.isLong ? a.value <= entry.triggerPrice : a.value >= entry.triggerPrice) ? "wrong-side" : null;
+}
+
+/** the TP level an attached take-profit implies for a reference (fill or trigger) price */
+export function attachedTpLevel(a: AttachedStop, isLong: boolean, refPrice: number): number {
+  if (a.mode === "price") return a.value;
+  return isLong ? refPrice * (1 + a.value) : refPrice * (1 - a.value);
+}
+
+/** Fill-time resolution of a take-profit: no bust clamp applies on the profit side; a level the market already passed fires. */
+export function resolveAttachedTp(a: AttachedStop, fill: { isLong: boolean; entryPrice: number }): { stopPrice: number } | null {
+  if (!isPosFinite(fill.entryPrice)) return null;
+  const raw = attachedTpLevel(a, fill.isLong, fill.entryPrice);
+  return isPosFinite(raw) ? { stopPrice: raw } : null;
 }
 
 /** absent/null → null (no stop); valid → the stop; anything else → undefined (reject) */
@@ -430,7 +492,10 @@ export function validateArmStopSpec(x: unknown, instruments: InstrumentSet): Arm
   if (typeof s.instrumentId !== "number" || !instruments.has(s.instrumentId)) return null;
   if (typeof s.isLong !== "boolean") return null;
   if (!isPosFinite(s.stopPrice) || s.stopPrice > 1e12) return null;
-  return { positionId: s.positionId, instrumentId: s.instrumentId, isLong: s.isLong, stopPrice: s.stopPrice };
+  if (!(s.exit === undefined || s.exit === null || s.exit === "stop" || s.exit === "tp")) return null;
+  const out: ArmStopSpec = { positionId: s.positionId, instrumentId: s.instrumentId, isLong: s.isLong, stopPrice: s.stopPrice };
+  if (s.exit === "tp") out.exit = "tp";
+  return out;
 }
 
 export function validateTriggerEntry(x: unknown, instruments: InstrumentSet): TriggerEntry | null {

@@ -1,4 +1,4 @@
-﻿// The watcher engine (SPEC.md §6). One pass every tick on the leader:
+// The watcher engine (SPEC.md §6). One pass every tick on the leader:
 // housekeeping → reconcile → stops → entries → heartbeat.
 //
 // This is the client engine's state machine (src/triggers.ts, now deleted)
@@ -25,6 +25,7 @@ import {
   nextStopState,
   pastLevel,
   resolveAttachedStop,
+  resolveAttachedTp,
   stopHit,
   type PriceSample,
 } from "../shared/triggerLogic";
@@ -649,18 +650,15 @@ export class Engine {
    * samples fires, which is what a stop means.
    */
   private async executeWithAttachedStop(entry: Entry, position: LivePosition, now: number) {
-    const a = entry.attachedStop;
-    if (!a || entry.spawnedStopId) {
+    const wantStop = entry.attachedStop && !entry.spawnedStopId ? entry.attachedStop : null;
+    const wantTp = entry.attachedTp && !entry.spawnedTpId ? entry.attachedTp : null;
+    if (!wantStop && !wantTp) {
       await this.save(entry);
       return;
     }
-    const resolved = resolveAttachedStop(a, { isLong: position.isLong, entryPrice: position.entryPrice, bustPrice: position.bustPrice });
-    if (!resolved) {
-      log.warn(`attached stop for ${entry.id} could not be resolved (entry ${position.entryPrice}, bust ${position.bustPrice}) — not created`);
-      await this.save(entry);
-      return;
-    }
-    const stop: Stop = {
+    const spawns: Stop[] = [];
+    const audits: Array<Record<string, unknown>> = [];
+    const mk = (stopPrice: number, exit: "stop" | "tp"): Stop => ({
       kind: "stop",
       version: 1,
       id: randomUUID(),
@@ -668,29 +666,56 @@ export class Engine {
       positionId: position.positionId,
       instrumentId: entry.instrumentId,
       isLong: entry.isLong,
-      stopPrice: resolved.stopPrice,
+      stopPrice,
+      ...(exit === "tp" ? { exit } : {}),
       status: "armed",
       createdAt: now,
       confirmingSince: null,
       crossSampleTs: null,
       absentEvals: 0,
       fromEntryId: entry.id,
-    };
-    entry.spawnedStopId = stop.id;
-    if (resolved.clamped) entry.spawnNote = "clamped";
-    const ok = await this.d.repo.updateTriggerAndSpawn(entry, stop);
+    });
+    if (wantStop) {
+      const resolved = resolveAttachedStop(wantStop, { isLong: position.isLong, entryPrice: position.entryPrice, bustPrice: position.bustPrice });
+      if (!resolved) {
+        log.warn(`attached stop for ${entry.id} could not be resolved (entry ${position.entryPrice}, bust ${position.bustPrice}) — not created`);
+      } else {
+        const stop = mk(resolved.stopPrice, "stop");
+        spawns.push(stop);
+        entry.spawnedStopId = stop.id;
+        if (resolved.clamped) entry.spawnNote = "clamped";
+        audits.push({ triggerId: stop.id, exit: "stop", stopPrice: resolved.stopPrice, clamped: resolved.clamped, mode: wantStop.mode, value: wantStop.value });
+      }
+    }
+    if (wantTp) {
+      const resolved = resolveAttachedTp(wantTp, { isLong: position.isLong, entryPrice: position.entryPrice });
+      if (!resolved) {
+        log.warn(`attached take-profit for ${entry.id} could not be resolved (entry ${position.entryPrice}) — not created`);
+      } else {
+        const tp = mk(resolved.stopPrice, "tp");
+        spawns.push(tp);
+        entry.spawnedTpId = tp.id;
+        audits.push({ triggerId: tp.id, exit: "tp", stopPrice: resolved.stopPrice, mode: wantTp.mode, value: wantTp.value });
+      }
+    }
+    const ok = await this.d.repo.updateTriggerAndSpawn(entry, spawns);
     if (!ok) {
       log.info(`stale write dropped for ${entry.id} (executed + spawn) — someone else moved it`);
       return;
     }
-    await this.d.repo.audit({
-      at: now,
-      wallet: entry.wallet,
-      triggerId: stop.id,
-      event: "spawn.stop",
-      detail: { fromEntryId: entry.id, positionId: position.positionId, stopPrice: resolved.stopPrice, clamped: resolved.clamped, mode: a.mode, value: a.value },
-    });
-    log.info(`entry ${entry.id} filled @ ${position.entryPrice} → stop ${stop.id} armed @ ${resolved.stopPrice}${resolved.clamped ? " (clamped to bust)" : ""}`);
+    for (const a of audits) {
+      const { triggerId, ...detail } = a;
+      await this.d.repo.audit({
+        at: now,
+        wallet: entry.wallet,
+        triggerId: triggerId as string,
+        event: "spawn.stop",
+        detail: { fromEntryId: entry.id, positionId: position.positionId, ...detail },
+      });
+    }
+    log.info(
+      `entry ${entry.id} filled @ ${position.entryPrice} → ${spawns.map((s) => `${s.exit === "tp" ? "tp" : "stop"} ${s.id} @ ${s.stopPrice}`).join(", ") || "no exits"}${entry.spawnNote === "clamped" ? " (stop clamped to bust)" : ""}`
+    );
   }
 
   private matchClose(stop: Stop, ops: WalletSnapshot["operations"]) {

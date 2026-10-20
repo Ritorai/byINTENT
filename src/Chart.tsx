@@ -14,7 +14,7 @@ export interface TradePreview {
 /** A trigger order waiting on the server, drawn as a level on the chart. */
 export interface TriggerLine {
   id: string;
-  kind: "entry" | "stop";
+  kind: "entry" | "stop" | "tp";
   price: number;
   isLong: boolean;
   /** entries only */
@@ -1066,13 +1066,17 @@ export default function Chart({ state, onFollowChange }: ChartProps) {
         const label =
           tl.kind === "stop"
             ? tl.ghost ? "STOP · ON FILL" : tl.attention ? "STOP !" : "STOP"
-            : `${tl.attention ? "! " : ""}TRIG ${tl.isLong ? "⬈" : "⬊"}${tl.leverage ? ` ${tl.leverage}×` : ""}`;
+            : tl.kind === "tp"
+              ? tl.ghost ? "TP · ON FILL" : tl.attention ? "TP !" : "TP"
+              : `${tl.attention ? "! " : ""}TRIG ${tl.isLong ? "⬈" : "⬊"}${tl.leverage ? ` ${tl.leverage}×` : ""}`;
+        // exits are coloured by what they do to the position: stop = loss side, TP = profit side
+        const color = tl.kind === "stop" ? C.red : tl.kind === "tp" ? C.green : C.trigger;
         const inRange = tl.price > rLo && tl.price < rHi;
         ctx.save();
         ctx.globalAlpha = tl.pending || tl.ghost ? 0.4 : tl.attention ? 0.55 + 0.25 * Math.sin(now / 250) : 0.95;
         if (inRange) {
           const y = Math.round(yOf(tl.price)) + 0.5;
-          ctx.strokeStyle = C.trigger;
+          ctx.strokeStyle = color;
           ctx.lineWidth = tl.pending || tl.ghost ? 1 : 1.5;
           ctx.setLineDash(tl.ghost ? [1, 5] : [2, 4]);
           ctx.lineCap = "round";
@@ -1080,12 +1084,12 @@ export default function Chart({ state, onFollowChange }: ChartProps) {
           ctx.moveTo(0, y);
           ctx.lineTo(plotW, y);
           ctx.stroke();
-          chip(plotW + 4, y, fmtPrice(tl.price), C.trigger, undefined, label);
+          chip(plotW + 4, y, fmtPrice(tl.price), color, undefined, label);
         } else if (!tl.pending && !tl.ghost) {
           const below = tl.price <= rLo;
           // stack several pinned chips instead of painting them over each other
           const y = below ? plotH - 28 - 20 * pinnedBelow++ : 28 + 20 * pinnedAbove++;
-          chip(plotW + 4, y, `${below ? "▼" : "▲"} ${fmtPrice(tl.price)}`, C.trigger, undefined, label);
+          chip(plotW + 4, y, `${below ? "▼" : "▲"} ${fmtPrice(tl.price)}`, color, undefined, label);
         }
         ctx.restore();
       }

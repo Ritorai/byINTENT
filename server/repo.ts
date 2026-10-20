@@ -9,8 +9,8 @@
 //  - `casFire` is the single-fire gate: armed/confirming → firing exactly once;
 //  - `revokeKey` is atomic across key + triggers.
 
-import type { AttachedStop, StopLoss, TriggerEntry, TriggerStatus } from "../shared/triggerLogic";
-import { isLive, isTerminal } from "../shared/triggerLogic";
+import type { AttachedStop, ExitKind, StopLoss, TriggerEntry, TriggerStatus } from "../shared/triggerLogic";
+import { exitOf, isLive, isTerminal } from "../shared/triggerLogic";
 
 export type TriggerRecord =
   | ({ kind: "entry"; version: number } & TriggerEntry)
@@ -79,9 +79,9 @@ export interface Repo {
   /** optimistic write; false = version moved (caller reloads next pass) */
   updateTrigger(rec: TriggerRecord): Promise<boolean>;
   /** atomic: optimistic update of `rec` + insert of `spawn` (the stop an executed entry asked for); false = stale, nothing written */
-  updateTriggerAndSpawn(rec: TriggerRecord, spawn: TriggerRecord): Promise<boolean>;
-  /** set / clear the stop an armed entry will spawn on fill (entry must still be waiting) */
-  setAttachedStop(wallet: string, id: string, stop: AttachedStop | null): Promise<TriggerRecord | null>;
+  updateTriggerAndSpawn(rec: TriggerRecord, spawns: TriggerRecord[]): Promise<boolean>;
+  /** set / clear the stop or take-profit an armed entry will spawn on fill (entry must still be waiting) */
+  setAttachedStop(wallet: string, id: string, stop: AttachedStop | null, which?: ExitKind): Promise<TriggerRecord | null>;
   /** armed/confirming → firing, exactly once. Returns the firing row or null. */
   casFire(id: string, firedAt: number, prePositionIds: string[] | null): Promise<TriggerRecord | null>;
   /** user mutations (wallet-scoped) — return the updated row or null when not applicable */
@@ -89,7 +89,7 @@ export interface Repo {
   rearmTrigger(wallet: string, id: string): Promise<TriggerRecord | null>;
   requestCancelQueued(wallet: string, id: string): Promise<TriggerRecord | null>;
   /** armed/confirming stops on this position → cancelled (one live stop per position) */
-  supersedeLiveStops(wallet: string, positionId: string): Promise<number>;
+  supersedeLiveStops(wallet: string, positionId: string, exit?: ExitKind): Promise<number>;
   countLiveTriggers(wallet: string): Promise<number>;
   /** cancel every live/attention trigger of a wallet (revoke path) */
   cancelAllLive(wallet: string, reason: string): Promise<number>;
@@ -186,18 +186,20 @@ export class MemoryRepo implements Repo {
     rec.version += 1;
     return true;
   }
-  async updateTriggerAndSpawn(rec: TriggerRecord, spawn: TriggerRecord) {
+  async updateTriggerAndSpawn(rec: TriggerRecord, spawns: TriggerRecord[]) {
     const cur = this.triggers.get(rec.id);
     if (!cur || cur.version !== rec.version) return false;
-    if (this.triggers.has(spawn.id)) throw new Error("duplicate trigger id");
+    for (const spawn of spawns) if (this.triggers.has(spawn.id)) throw new Error("duplicate trigger id");
     this.triggers.set(rec.id, clone({ ...rec, version: rec.version + 1 }));
     rec.version += 1;
-    this.triggers.set(spawn.id, clone({ ...spawn, version: 1 }));
+    for (const spawn of spawns) this.triggers.set(spawn.id, clone({ ...spawn, version: 1 }));
     return true;
   }
-  async setAttachedStop(wallet: string, id: string, stop: AttachedStop | null) {
+  async setAttachedStop(wallet: string, id: string, stop: AttachedStop | null, which: ExitKind = "stop") {
     return this.mutate(wallet, id, ["armed", "confirming", "attention"], (t) => {
-      if (t.kind === "entry") t.attachedStop = stop;
+      if (t.kind !== "entry") return;
+      if (which === "tp") t.attachedTp = stop;
+      else t.attachedStop = stop;
     });
   }
   async casFire(id: string, firedAt: number, prePositionIds: string[] | null) {
@@ -243,10 +245,10 @@ export class MemoryRepo implements Repo {
       t.cancelRequested = true;
     });
   }
-  async supersedeLiveStops(wallet: string, positionId: string) {
+  async supersedeLiveStops(wallet: string, positionId: string, exit: ExitKind = "stop") {
     let n = 0;
     for (const t of this.triggers.values()) {
-      if (t.kind === "stop" && t.wallet === wallet.toLowerCase() && t.positionId === positionId && (t.status === "armed" || t.status === "confirming")) {
+      if (t.kind === "stop" && t.wallet === wallet.toLowerCase() && t.positionId === positionId && exitOf(t) === exit && (t.status === "armed" || t.status === "confirming")) {
         t.status = "cancelled";
         t.version += 1;
         n++;
