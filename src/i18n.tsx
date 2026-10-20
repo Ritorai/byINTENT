@@ -375,7 +375,7 @@ const en = {
   "ladder.title": "Entry",
   "ladder.one": "Single",
   "ladder.many": "Ladder",
-  "ladder.range": "From – to · rungs",
+  "ladder.range": "Range",
   "ladder.from": "From",
   "ladder.to": "To",
   "ladder.count": "Rungs",

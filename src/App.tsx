@@ -37,7 +37,8 @@ const zeroVersion = () => 0;
 const LAYOUT_KEY = "byintent.layout.v1";
 const BAR_MIN = 150; // = .tradebar min-height
 const MAIN_MIN = 395; // chart-wrap min-height + borders — the middle row never gets smaller
-const panelMin = () => Math.max(260, Math.min(290, window.innerWidth * 0.18)); // = clamp(260px, 18vw, 290px)
+const PANEL_MIN = 300; // ticket must stay wide enough for every field (ladder, size, lev)
+const panelMin = () => Math.max(PANEL_MIN, Math.min(320, window.innerWidth * 0.22));
 interface Layout {
   panelW: number | null;
   barH: number | null;
@@ -46,7 +47,7 @@ function readLayout(): Layout {
   try {
     const j = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? "{}");
     return {
-      panelW: typeof j.panelW === "number" ? j.panelW : null,
+      panelW: typeof j.panelW === "number" ? Math.max(j.panelW, PANEL_MIN) : null,
       barH: typeof j.barH === "number" ? j.barH : null,
     };
   } catch {
@@ -751,12 +752,13 @@ export default function App() {
         >
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden>
             <path
-              d="M17.6 15.5A7.6 7.6 0 0 1 8.5 6.4a7.6 7.6 0 1 0 9.1 9.1Z"
-              fill={dark ? "currentColor" : "none"}
+              d="M12 3.2a6.3 6.3 0 0 0-3.6 11.4V16.8h7.2v-2.2A6.3 6.3 0 0 0 12 3.2Z"
+              fill={dark ? "none" : "currentColor"}
               stroke="currentColor"
               strokeWidth="1.5"
               strokeLinejoin="round"
             />
+            <path d="M10 19.2h4M10.6 21.2h2.8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
           </svg>
         </button>
         <ConnectControls />

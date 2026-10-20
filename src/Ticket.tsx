@@ -676,22 +676,28 @@ export default function Ticket({
             <div className="fld">
               <div className="fld-head">
                 <label htmlFor="lad-from">{t("ladder.range")}</label>
-                {ladderValid && (
-                  <span className="fld-aux">
-                    {rungCount} × {marginValid ? fmtUsd(rungs[0] ?? 0) : "—"}
-                  </span>
-                )}
+                <span className="fld-aux ladder-n">
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    min={MIN_LADDER_RUNGS}
+                    max={MAX_LADDER_RUNGS}
+                    step={1}
+                    value={ladderCount}
+                    onChange={(e) => setLadderCount(e.target.value)}
+                    aria-label={t("ladder.count")}
+                  />
+                  {ladderValid && marginValid ? <i>{rungCount} × {fmtUsd(rungs[0] ?? 0)}</i> : <i>{t("ladder.count")}</i>}
+                </span>
               </div>
-              <div className="ladder-row">
+              <div className="ladder-stack">
                 <div className="fld-in">
                   <input id="lad-from" type="number" inputMode="decimal" min={0} step="any" placeholder={t("ladder.from")} value={ladderFrom} onChange={(e) => setLadderFrom(e.target.value)} />
+                  <span className="fld-unit">{t("ladder.from")}</span>
                 </div>
-                <span className="muted">–</span>
                 <div className="fld-in">
                   <input type="number" inputMode="decimal" min={0} step="any" placeholder={t("ladder.to")} value={ladderTo} onChange={(e) => setLadderTo(e.target.value)} />
-                </div>
-                <div className="fld-in lad-n">
-                  <input type="number" inputMode="numeric" min={MIN_LADDER_RUNGS} max={MAX_LADDER_RUNGS} step={1} value={ladderCount} onChange={(e) => setLadderCount(e.target.value)} aria-label={t("ladder.count")} />
+                  <span className="fld-unit">{t("ladder.to")}</span>
                 </div>
               </div>
             </div>
