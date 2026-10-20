@@ -2508,3 +2508,67 @@ button.trig-switch[disabled] {
   color: var(--warning);
   border-color: var(--warning);
 }
+
+.ladder-row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr 52px;
+  gap: 6px;
+  align-items: center;
+}
+
+.ladder-row .lad-n input {
+  text-align: center;
+}
+
+.policy {
+  margin: 2px 6px 8px;
+  padding: 4px 8px 6px;
+}
+
+.policy-toggle {
+  font-size: 11px;
+}
+
+.policy-trip {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--neg);
+}
+
+.policy-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 10px;
+  margin-top: 8px;
+}
+
+.policy-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font: 600 10.5px var(--font);
+  color: var(--muted);
+}
+
+.policy-form input {
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--page);
+  color: var(--ink);
+  padding: 0 8px;
+  font: 600 12px var(--font);
+  font-variant-numeric: tabular-nums;
+}
+
+.policy-mkts {
+  display: flex;
+  gap: 6px;
+  align-items: end;
+}
+
+.policy-today {
+  grid-column: 1 / -1;
+  font-size: 11px;
+}

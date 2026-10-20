@@ -4,7 +4,7 @@
 // extracted into columns for indexing and atomic transitions.
 
 import type { Pool, PoolClient } from "pg";
-import type { AttachedStop, ExitKind } from "../shared/triggerLogic";
+import type { AttachedStop, ExitKind, WalletDay, WalletPolicy } from "../shared/triggerLogic";
 import type {
   AuditEvent,
   Heartbeat,
@@ -16,6 +16,7 @@ import type {
   TriggerRecord,
   WalletSettings,
 } from "./repo";
+import { emptySettings } from "./repo";
 
 const TERMINAL_SQL = `('executed','unreconciled','expired','failed','cancelled','done')`;
 
@@ -138,6 +139,11 @@ export class PgRepo implements Repo {
 
   async migrate(): Promise<void> {
     await this.pool.query(SCHEMA_SQL);
+    await this.pool.query(`
+      ALTER TABLE wallet_settings ADD COLUMN IF NOT EXISTS policy jsonb NOT NULL DEFAULT '{}'::jsonb;
+      ALTER TABLE wallet_settings ADD COLUMN IF NOT EXISTS day jsonb NOT NULL DEFAULT '{}'::jsonb;
+      ALTER TABLE wallet_settings ADD COLUMN IF NOT EXISTS exposure jsonb NOT NULL DEFAULT '{}'::jsonb;
+    `);
   }
 
   private async tx<T>(fn: (c: PoolClient) => Promise<T>): Promise<T> {
@@ -284,9 +290,19 @@ export class PgRepo implements Repo {
   }
 
   // ---- settings ---------------------------------------------------------------
+  private settingsFromRow(r: { enabled: boolean; policy: unknown; day: unknown; exposure: unknown } | undefined): WalletSettings {
+    if (!r) return emptySettings();
+    const policy = r.policy && typeof r.policy === "object" && !Array.isArray(r.policy) ? (r.policy as WalletPolicy) : {};
+    const day = r.day && typeof r.day === "object" && !Array.isArray(r.day) ? (r.day as WalletDay) : emptySettings().day;
+    const exposure = r.exposure && typeof r.exposure === "object" && !Array.isArray(r.exposure) ? (r.exposure as Record<string, number>) : {};
+    return { enabled: !!r.enabled, policy, day, exposure };
+  }
   async getWalletSettings(wallet: string): Promise<WalletSettings> {
-    const r = await this.pool.query<{ enabled: boolean }>(`SELECT enabled FROM wallet_settings WHERE wallet = $1`, [wallet.toLowerCase()]);
-    return { enabled: r.rows[0] ? !!r.rows[0].enabled : true };
+    const r = await this.pool.query<{ enabled: boolean; policy: unknown; day: unknown; exposure: unknown }>(
+      `SELECT enabled, policy, day, exposure FROM wallet_settings WHERE wallet = $1`,
+      [wallet.toLowerCase()]
+    );
+    return this.settingsFromRow(r.rows[0]);
   }
   async setWalletEnabled(wallet: string, enabled: boolean) {
     await this.pool.query(
@@ -294,6 +310,42 @@ export class PgRepo implements Repo {
        ON CONFLICT (wallet) DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()`,
       [wallet.toLowerCase(), enabled]
     );
+  }
+  async setWalletPolicy(wallet: string, policy: WalletPolicy): Promise<WalletSettings> {
+    const r = await this.pool.query<{ enabled: boolean; policy: unknown; day: unknown; exposure: unknown }>(
+      `INSERT INTO wallet_settings (wallet, enabled, policy, day)
+       VALUES ($1, true, $2::jsonb, '{}'::jsonb)
+       ON CONFLICT (wallet) DO UPDATE SET
+         policy = EXCLUDED.policy,
+         day = COALESCE(wallet_settings.day, '{}'::jsonb) || '{"tripped":null}'::jsonb,
+         updated_at = now()
+       RETURNING enabled, policy, day, exposure`,
+      [wallet.toLowerCase(), JSON.stringify(policy)]
+    );
+    return this.settingsFromRow(r.rows[0]);
+  }
+  async saveWalletRuntime(wallet: string, day: WalletDay, exposure: Record<string, number>) {
+    await this.pool.query(
+      `INSERT INTO wallet_settings (wallet, enabled, day, exposure) VALUES ($1, true, $2::jsonb, $3::jsonb)
+       ON CONFLICT (wallet) DO UPDATE SET day = EXCLUDED.day, exposure = EXCLUDED.exposure, updated_at = now()`,
+      [wallet.toLowerCase(), JSON.stringify(day), JSON.stringify(exposure)]
+    );
+  }
+  async cancelLiveEntries(wallet: string, reason: string) {
+    const r = await this.pool.query(
+      `UPDATE triggers SET status = 'cancelled', data = data || $2::jsonb, version = version + 1, updated_at = now()
+       WHERE wallet = $1 AND kind = 'entry' AND status IN ('armed','confirming','attention')`,
+      [wallet.toLowerCase(), JSON.stringify({ status: "cancelled", error: reason })]
+    );
+    return r.rowCount ?? 0;
+  }
+  async cancelGroup(wallet: string, groupId: string) {
+    const r = await this.pool.query(
+      `UPDATE triggers SET status = 'cancelled', data = data || '{"status":"cancelled"}'::jsonb, version = version + 1, updated_at = now()
+       WHERE wallet = $1 AND kind = 'entry' AND status IN ('armed','confirming','attention') AND data->>'groupId' = $2`,
+      [wallet.toLowerCase(), groupId]
+    );
+    return r.rowCount ?? 0;
   }
 
   // ---- keys -------------------------------------------------------------------

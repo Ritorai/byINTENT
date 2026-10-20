@@ -19,15 +19,22 @@ import {
   FIRING_GRACE_MS,
   INTENT_TTL_MS,
   STOP_RETRY_COOLDOWN_MS,
+  exposureSum,
   freshSample,
   isLive,
   nextEntryState,
   nextStopState,
   pastLevel,
+  policyBlocksEntry,
+  ratchetTrail,
   resolveAttachedStop,
   resolveAttachedTp,
+  rolloverDay,
   stopHit,
+  exitOf,
   type PriceSample,
+  type WalletDay,
+  type WalletPolicy,
 } from "../shared/triggerLogic";
 import type { LivePosition, WalletSnapshot } from "../shared/walletFrames";
 import { randomUUID } from "node:crypto";
@@ -74,6 +81,9 @@ interface WalletCtx {
   keyOk: boolean;
   key: KeyRow | null;
   proto: ProtoState | null;
+  policy: WalletPolicy;
+  day: WalletDay;
+  exposure: Record<string, number>;
 }
 
 const BLOCK_CODES: ReadonlySet<string> = new Set(["session", "key-revoked", "key-expired", "trading-paused"]);
@@ -153,9 +163,22 @@ export class Engine {
     for (const [wallet, items] of byWallet) {
       const snap = this.d.wallets.get(wallet)?.snapshot ?? null;
       const settings = await this.d.repo.getWalletSettings(wallet);
+      const runtime = await this.syncWalletRuntime(wallet, settings.policy, settings.day, settings.exposure, snap, now);
       const key = this.keys.get(wallet) ?? null;
       const keyOk = !!key && key.status === "active" && key.expiryS > Math.floor(now / 1000) + 5;
-      const ctx: WalletCtx = { wallet, snap, samples, now, enabled: settings.enabled, keyOk, key, proto: protoNow };
+      const ctx: WalletCtx = {
+        wallet,
+        snap,
+        samples,
+        now,
+        enabled: settings.enabled,
+        keyOk,
+        key,
+        proto: protoNow,
+        policy: settings.policy,
+        day: runtime.day,
+        exposure: runtime.exposure,
+      };
 
       await this.reconcile(items, ctx);
 
@@ -180,6 +203,49 @@ export class Engine {
 
     for (const r of rows) this.known.add(r.id);
     for (const [k, s] of Object.entries(samples)) if (s && s.live && Number.isFinite(s.price)) this.prevSamples.set(Number(k), s);
+  }
+
+  /**
+   * Roll the UTC day, fold lifetime realized-PnL into today's tally, drop
+   * exposure for positions that are gone, and trip the daily-loss stop (which
+   * cancels waiting entries — stops keep protecting).
+   */
+  private async syncWalletRuntime(
+    wallet: string,
+    policy: WalletPolicy,
+    prevDay: WalletDay,
+    prevExposure: Record<string, number>,
+    snap: WalletSnapshot | null,
+    now: number
+  ): Promise<{ day: WalletDay; exposure: Record<string, number> }> {
+    const day = rolloverDay(prevDay, now);
+    const openIds = new Set((snap?.openPositions ?? []).map((p) => p.positionId));
+    const exposure: Record<string, number> = {};
+    for (const [id, v] of Object.entries(prevExposure)) if (openIds.has(id) && Number.isFinite(v)) exposure[id] = v;
+
+    let dirty = day.date !== prevDay?.date || Object.keys(exposure).length !== Object.keys(prevExposure).length;
+    if (snap && Number.isFinite(snap.lifetime.realizedPnl)) {
+      const seen = day.seenRealized;
+      if (seen == null || !Number.isFinite(seen)) {
+        day.seenRealized = snap.lifetime.realizedPnl;
+        dirty = true;
+      } else if (snap.lifetime.realizedPnl !== seen) {
+        day.realizedPnl += snap.lifetime.realizedPnl - seen;
+        day.seenRealized = snap.lifetime.realizedPnl;
+        dirty = true;
+      }
+    }
+
+    const shouldTrip = !day.tripped && policy.dailyLossStop != null && day.realizedPnl <= -policy.dailyLossStop;
+    if (shouldTrip) {
+      day.tripped = "policy-daily-loss";
+      dirty = true;
+      const n = await this.d.repo.cancelLiveEntries(wallet, "policy-daily-loss");
+      await this.d.repo.audit({ at: now, wallet, triggerId: null, event: "policy.trip", detail: { reason: "policy-daily-loss", realizedPnl: day.realizedPnl, cancelled: n } });
+      log.warn(`daily-loss stop tripped for ${wallet.slice(0, 10)}… (${day.realizedPnl.toFixed(2)}) — cancelled ${n} entries`);
+    }
+    if (dirty) await this.d.repo.saveWalletRuntime(wallet, day, exposure);
+    return { day, exposure };
   }
 
   // ---------------------------------------------------------------------------
@@ -354,6 +420,16 @@ export class Engine {
 
     const sample = ctx.samples[stop.instrumentId];
     if (!freshSample(sample, ctx.now)) return; // stale price: the stop waits for a fresh print (B)
+    // trail ratchets off a confirmed sample before the hit test — never backwards
+    if (stop.trail && exitOf(stop) !== "tp") {
+      const pos = snap?.openPositions.find((p) => p.positionId === stop.positionId);
+      const moved = ratchetTrail(stop, sample.price, pos?.bustPrice);
+      if (moved) {
+        stop.stopPrice = moved.stopPrice;
+        stop.highWater = moved.highWater;
+        await this.save(stop);
+      }
+    }
     const step = nextStopState(stop, sample, ctx.now);
     if (step.fire) return this.initiateStopFire(stop, ctx);
     if (step.status !== stop.status || step.crossSampleTs !== (stop.crossSampleTs ?? null)) {
@@ -461,10 +537,15 @@ export class Engine {
     if (entry.marginUsdc > available + EPSILON) return fail("insufficient-available");
     if (entry.marginUsdc < ctx.proto.minTrade) return fail("below-min-trade");
     if (entry.marginUsdc * entry.leverage < ctx.proto.minNotional) return fail("below-min-notional");
+    const openIds = new Set(ctx.snap.openPositions.map((p) => p.positionId));
+    const policyFail = policyBlocksEntry(ctx.policy, ctx.day, entry, exposureSum(ctx.exposure, openIds));
+    if (policyFail) return fail(policyFail);
 
     const pre = ctx.snap.openPositions.filter((p) => p.instrumentId === entry.instrumentId).map((p) => p.positionId);
     const fired = await this.d.repo.casFire(entry.id, ctx.now, pre);
     if (!fired || fired.kind !== "entry") return 0; // lost the race — nothing signed
+    ctx.day.fires += 1;
+    await this.d.repo.saveWalletRuntime(ctx.wallet, ctx.day, ctx.exposure);
     this.ownedFiring.add(entry.id);
     void this.submitEntry(fired);
     return entry.marginUsdc;
@@ -652,6 +733,8 @@ export class Engine {
   private async executeWithAttachedStop(entry: Entry, position: LivePosition, now: number) {
     const wantStop = entry.attachedStop && !entry.spawnedStopId ? entry.attachedStop : null;
     const wantTp = entry.attachedTp && !entry.spawnedTpId ? entry.attachedTp : null;
+    entry.executedPositionId = position.positionId;
+    await this.noteExposure(entry.wallet, position.positionId, position.margin * position.leverage);
     if (!wantStop && !wantTp) {
       await this.save(entry);
       return;
@@ -681,6 +764,10 @@ export class Engine {
         log.warn(`attached stop for ${entry.id} could not be resolved (entry ${position.entryPrice}, bust ${position.bustPrice}) — not created`);
       } else {
         const stop = mk(resolved.stopPrice, "stop");
+        if (wantStop.trail) {
+          stop.trail = { mode: wantStop.mode, value: wantStop.value };
+          stop.highWater = position.entryPrice;
+        }
         spawns.push(stop);
         entry.spawnedStopId = stop.id;
         if (resolved.clamped) entry.spawnNote = "clamped";
@@ -716,6 +803,13 @@ export class Engine {
     log.info(
       `entry ${entry.id} filled @ ${position.entryPrice} → ${spawns.map((s) => `${s.exit === "tp" ? "tp" : "stop"} ${s.id} @ ${s.stopPrice}`).join(", ") || "no exits"}${entry.spawnNote === "clamped" ? " (stop clamped to bust)" : ""}`
     );
+  }
+
+  private async noteExposure(wallet: string, positionId: string, notional: number) {
+    const s = await this.d.repo.getWalletSettings(wallet);
+    if (s.exposure[positionId] === notional) return;
+    s.exposure[positionId] = notional;
+    await this.d.repo.saveWalletRuntime(wallet, s.day, s.exposure);
   }
 
   private matchClose(stop: Stop, ops: WalletSnapshot["operations"]) {

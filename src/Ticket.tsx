@@ -27,7 +27,15 @@ import {
   sessionStatus,
 } from "./session";
 import type { ApiResult, ArmEntrySpec, AttachedStop, CrossDirection, RemoteTriggerStore } from "./triggerApi";
-import { attachedStopLevel, attachedStopProblem, attachedTpLevel, attachedTpProblem } from "../shared/triggerLogic";
+import {
+  MAX_LADDER_RUNGS,
+  MIN_LADDER_RUNGS,
+  attachedStopLevel,
+  attachedStopProblem,
+  attachedTpLevel,
+  attachedTpProblem,
+  splitMargin,
+} from "../shared/triggerLogic";
 import { TriggerSetupModal, apiErrorText, isUserRejection, triggerPhase, useNowTick } from "./TriggerSetup";
 
 interface TicketProps {
@@ -97,6 +105,11 @@ export default function Ticket({
   const [stopText, setStopText] = useState("");
   const [tpMode, setTpMode] = useState<"off" | "pct" | "price">("off");
   const [tpText, setTpText] = useState("");
+  const [stopTrail, setStopTrail] = useState(false);
+  const [ladderOn, setLadderOn] = useState(false);
+  const [ladderFrom, setLadderFrom] = useState("");
+  const [ladderTo, setLadderTo] = useState("");
+  const [ladderCount, setLadderCount] = useState("5");
   // enabling triggers: the explainer modal, then the registration signature — both off the big button
   const [setupOpen, setSetupOpen] = useState(false);
   const [regBusy, setRegBusy] = useState(false);
@@ -186,9 +199,23 @@ export default function Ticket({
   // price is a pullback entry (fires down-to), long above it a breakout
   // (up-to); shorts mirror. Without a live price, fall back to the side's
   // pullback direction.
-  const triggerPrice = Number(triggerText);
-  const triggerValid =
-    triggerText.trim() !== "" && Number.isFinite(triggerPrice) && triggerPrice > 0;
+  const fromPrice = Number(ladderFrom);
+  const toPrice = Number(ladderTo);
+  const rungCount = Math.round(Number(ladderCount));
+  const ladderValid =
+    ladderOn &&
+    Number.isFinite(fromPrice) &&
+    fromPrice > 0 &&
+    Number.isFinite(toPrice) &&
+    toPrice > 0 &&
+    fromPrice !== toPrice &&
+    Number.isInteger(rungCount) &&
+    rungCount >= MIN_LADDER_RUNGS &&
+    rungCount <= MAX_LADDER_RUNGS;
+  const triggerPrice = ladderOn ? (fromPrice + toPrice) / 2 : Number(triggerText);
+  const triggerValid = ladderOn
+    ? ladderValid
+    : triggerText.trim() !== "" && Number.isFinite(triggerPrice) && triggerPrice > 0;
   const triggerCross: CrossDirection =
     lastPrice != null
       ? isLong
@@ -208,6 +235,17 @@ export default function Ticket({
     triggerValid &&
     lastPrice != null &&
     (triggerCross === "down-to" ? lastPrice <= triggerPrice : lastPrice >= triggerPrice);
+  const rungs = ladderOn && ladderValid && marginValid ? splitMargin(margin, rungCount) : [];
+  const ladderProblem =
+    mode !== "trigger" || !ladderOn
+      ? null
+      : !ladderValid
+        ? t("ladder.p.range")
+        : rungs.some((m) => m < minTrade)
+          ? t("ladder.p.minMargin", { v: fmtUsd(minTrade), n: String(rungCount) })
+          : rungs.some((m) => m * leverage < minNotional)
+            ? t("ladder.p.minNotional", { v: fmtUsd(minNotional), n: String(rungCount) })
+            : null;
 
   // attached stop: what the watcher will arm on the fill. "pct" is typed as a
   // percentage (2 = 2 %) and sent as a fraction; the estimate below uses the
@@ -215,7 +253,9 @@ export default function Ticket({
   const stopNum = Number(stopText);
   const stopTyped = stopText.trim() !== "" && Number.isFinite(stopNum) && stopNum > 0;
   const attachedStop: AttachedStop | null =
-    mode === "trigger" && stopMode !== "off" && stopTyped ? { mode: stopMode, value: stopMode === "pct" ? stopNum / 100 : stopNum } : null;
+    mode === "trigger" && stopMode !== "off" && stopTyped
+      ? { mode: stopMode, value: stopMode === "pct" ? stopNum / 100 : stopNum, ...(stopTrail ? { trail: true } : {}) }
+      : null;
   const stopProblem =
     mode !== "trigger" || stopMode === "off"
       ? null
@@ -333,10 +373,36 @@ export default function Ticket({
 
   /** Arm a server-side trigger entry — the watcher evaluates and fires it (triggerApi.ts). */
   const doArm = async () => {
-    if (!address || problem || triggerProblem || stopProblem || tpProblem || !onArmEntry) return;
+    if (!address || problem || triggerProblem || stopProblem || tpProblem || ladderProblem || !onArmEntry) return;
     setBusy(true);
     setMsg(null);
     try {
+      if (ladderOn) {
+        if (!trigStore) {
+          setMsg(t("trig.connectOrders"));
+          return;
+        }
+        const r = await trigStore.armLadder({
+          instrumentId: MARKETS[market].id,
+          isLong,
+          leverage,
+          useDebt: false,
+          fromPrice,
+          toPrice,
+          count: rungCount,
+          totalMarginUsdc: margin,
+          cross: triggerCross,
+          expiresAt: expiry === "never" ? null : Date.now() + EXPIRY_MS[expiry],
+          attachedStop,
+          attachedTp,
+        });
+        if (!r.ok) {
+          setMsg(apiErrorText(t, r));
+          return;
+        }
+        onSubmitted(t("ladder.armed", { n: String(rungCount), market, from: fmtPrice(fromPrice), to: fmtPrice(toPrice) }));
+        return;
+      }
       const r = await onArmEntry({
         instrumentId: MARKETS[market].id,
         isLong,
@@ -407,7 +473,9 @@ export default function Ticket({
   const rMultiple = reward != null && maxLoss != null && maxLoss > 0 ? reward / maxLoss : null;
   const sizePctOfFree = snapshot && marginValid && limit.maximum > 0 ? Math.min(100, (margin / limit.maximum) * 100) : null;
   const ctaLabel =
-    mode === "trigger"
+    mode === "trigger" && ladderOn
+      ? t("ladder.cta", { n: String(ladderValid ? rungCount : "—"), market, lev: leverage })
+      : mode === "trigger"
       ? t(isLong ? "ticket.cta.armLong" : "ticket.cta.armShort", {
           market,
           cmp: triggerCross === "down-to" ? "≤" : "≥",
@@ -560,6 +628,30 @@ export default function Ticket({
           <>
             <div className="fld">
               <div className="fld-head">
+                <label>{t("ladder.title")}</label>
+                <div className="seg seg-mini" role="tablist">
+                  <button role="tab" className={!ladderOn ? "on" : ""} aria-selected={!ladderOn} onClick={() => setLadderOn(false)}>
+                    {t("ladder.one")}
+                  </button>
+                  <button
+                    role="tab"
+                    className={ladderOn ? "on" : ""}
+                    aria-selected={ladderOn}
+                    onClick={() => {
+                      setLadderOn(true);
+                      if (ladderFrom.trim() === "" && triggerValid) setLadderFrom(String(triggerPrice));
+                      if (ladderTo.trim() === "" && lastPrice != null) setLadderTo(String(Math.round(lastPrice * (isLong ? 0.97 : 1.03) * 10) / 10));
+                    }}
+                  >
+                    {t("ladder.many")}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {!ladderOn ? (
+            <div className="fld">
+              <div className="fld-head">
                 <label htmlFor="trig-in">{t("ticket.triggerPrice")}</label>
                 {triggerValid && lastPrice != null && (
                   <span className={`fld-aux tag ${triggerCross === "down-to" ? "down" : "up"}`}>
@@ -580,6 +672,30 @@ export default function Ticket({
                 <span className="fld-unit">USD</span>
               </div>
             </div>
+            ) : (
+            <div className="fld">
+              <div className="fld-head">
+                <label htmlFor="lad-from">{t("ladder.range")}</label>
+                {ladderValid && (
+                  <span className="fld-aux">
+                    {rungCount} × {marginValid ? fmtUsd(rungs[0] ?? 0) : "—"}
+                  </span>
+                )}
+              </div>
+              <div className="ladder-row">
+                <div className="fld-in">
+                  <input id="lad-from" type="number" inputMode="decimal" min={0} step="any" placeholder={t("ladder.from")} value={ladderFrom} onChange={(e) => setLadderFrom(e.target.value)} />
+                </div>
+                <span className="muted">–</span>
+                <div className="fld-in">
+                  <input type="number" inputMode="decimal" min={0} step="any" placeholder={t("ladder.to")} value={ladderTo} onChange={(e) => setLadderTo(e.target.value)} />
+                </div>
+                <div className="fld-in lad-n">
+                  <input type="number" inputMode="numeric" min={MIN_LADDER_RUNGS} max={MAX_LADDER_RUNGS} step={1} value={ladderCount} onChange={(e) => setLadderCount(e.target.value)} aria-label={t("ladder.count")} />
+                </div>
+              </div>
+            </div>
+            )}
 
             <div className="fld">
               <div className="fld-head">
@@ -625,6 +741,11 @@ export default function Ticket({
                   />
                   <span className="fld-unit">{stopMode === "pct" ? "%" : "USD"}</span>
                 </div>
+              )}
+              {stopMode !== "off" && (
+                <button type="button" className={stopTrail ? "preset on" : "preset"} onClick={() => setStopTrail((v) => !v)} title={t("trig.trailWhy")}>
+                  {t("trig.trail")}
+                </button>
               )}
             </div>
 
@@ -783,10 +904,10 @@ export default function Ticket({
           ) : (
             <button
               className={`gobtn ${sideClass}`}
-              disabled={busy || !!problem || !!triggerProblem || !!stopProblem || !!tpProblem}
+              disabled={busy || !!problem || !!triggerProblem || !!stopProblem || !!tpProblem || !!ladderProblem}
               onClick={() => void doArm()}
             >
-              {busy ? t("ticket.submitting") : problem ?? triggerProblem ?? stopProblem ?? tpProblem ?? ctaLabel}
+              {busy ? t("ticket.submitting") : problem ?? triggerProblem ?? stopProblem ?? tpProblem ?? ladderProblem ?? ctaLabel}
             </button>
           )
         ) : session.state === "none" || session.state === "expired" ? (

@@ -166,7 +166,11 @@ All JSON, all under `/api`. Errors: `{error: code, message?}`.
 | `POST /api/watcher/key/registered` | cookie | `{intentId}` advisory; activation is on-chain |
 | `POST /api/watcher/key/revoke` | cookie | → `{keyAddress}` (for the on-chain tx) |
 | `GET  /api/triggers` | cookie | → `{version, enabled, entries[], stops[]}` |
-| `POST /api/triggers/entry` | cookie | `ArmEntrySpec` (incl. optional `attachedStop` / `attachedTp`) → `TriggerEntry` |
+| `POST /api/triggers/entry` | cookie | `ArmEntrySpec` (incl. optional `attachedStop` / `attachedTp` / `groupId`) → `TriggerEntry` |
+| `POST /api/triggers/ladder` | cookie | `ArmLadderSpec` → `{groupId, entries[]}` |
+| `POST /api/triggers/group/:id/cancel` | cookie | cancel remaining armed rungs of a ladder |
+| `POST /api/triggers/policy` | cookie | `{policy}` set per-wallet fire caps |
+| `POST /api/triggers/policy/clear-trip` | cookie | lift a daily-loss trip so entries can fire again |
 | `POST /api/triggers/stop` | cookie | `ArmStopSpec` (`exit?: "stop" \| "tp"`, default stop) → `StopLoss` (supersedes the live exit *of that kind* on that position) |
 | `POST /api/triggers/:id/stop` | cookie | `{stop: AttachedStop \| null, which?: "stop" \| "tp"}` sets / clears the exit a waiting entry spawns on fill |
 | `POST /api/triggers/:id/cancel` | cookie | armed/confirming/attention → cancelled |
@@ -201,6 +205,22 @@ fixed level sits on the profit side of the trigger / entry. On fill, an entry
 spawns its `attachedStop` and `attachedTp` in the same transaction as its own
 `executed` write (`updateTriggerAndSpawn(rec, spawns[])`), so a bracket is
 either fully armed or not written at all.
+
+**Policy caps.** `wallet_settings.policy` is a user-set veto applied only to
+*entry* fires (stops and TPs still protect). Caps: max notional per fire, max
+open trigger exposure, daily loss stop (UTC; trips → waiting entries cancelled,
+stops stay), max fires/day, allowed markets, max leverage. Today's tally lives
+in `wallet_settings.day` (fires + realized PnL folded from the wallet stream's
+lifetime total). `wallet_settings.exposure` tracks trigger-opened position
+ids so exposure can be summed without a scan.
+
+**Trailing stop.** A stop row may carry `trail: {mode, value}` and `highWater`.
+Each fresh sample ratchets `stopPrice` toward price and never away (`ratchetTrail`);
+the write is optimistic so two leaders cannot loosen each other. TPs do not trail.
+
+**Ladder.** `POST /triggers/ladder` inserts N entries (2–20) with one `groupId`.
+Cap is 50 live triggers/wallet so a 20-rung ladder plus exits still fits.
+`POST /triggers/group/:id/cancel` cancels remaining armed rungs.
 
 ## 6. Engine
 

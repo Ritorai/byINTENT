@@ -16,10 +16,17 @@ import {
   attachedStopProblem,
   attachedTpProblem,
   exitOf,
+  exposureSum,
+  ladderPrices,
+  policyBlocksEntry,
+  rolloverDay,
+  splitMargin,
   validateArmEntrySpec,
+  validateArmLadderSpec,
   validateArmStopSpec,
   validateAttachedStop,
   validateAttachedTp,
+  validateWalletPolicy,
   type StopLoss,
   type TriggerEntry,
 } from "../shared/triggerLogic";
@@ -137,10 +144,14 @@ export function mountTriggerApi(app: Express, deps: ApiDeps): void {
   r.get("/me", requireAuth, limited(readW, wallet), async (req, res) => {
     const w = wallet(req);
     const [key, hb, kill, settings] = await Promise.all([repo.getKey(w), repo.getHeartbeat(), repo.getKill(), repo.getWalletSettings(w)]);
+    const day = rolloverDay(settings.day, now());
     res.json({
       wallet: w,
       key: publicKey(key),
       enabled: settings.enabled,
+      policy: settings.policy,
+      day,
+      exposure: exposureSum(settings.exposure),
       watcher: hb ? { alive: now() - hb.at < HEARTBEAT_ALIVE_MS, lastBeatAt: hb.at, feeds: hb.feeds, leader: hb.leader } : { alive: false, lastBeatAt: null, feeds: {}, leader: false },
       kill: kill?.on || env.envKill ? { on: true, reason: kill?.reason ?? "env", at: kill?.at ?? null } : null,
     });
@@ -224,6 +235,9 @@ export function mountTriggerApi(app: Express, deps: ApiDeps): void {
     if (spec.expiresAt != null && spec.expiresAt <= now() + 30_000) return err(res, 400, "bad_spec", "expiresAt is in the past.");
     if (!(await requireActiveKey(w, res))) return;
     if ((await repo.countLiveTriggers(w)) >= MAX_LIVE_TRIGGERS_PER_WALLET) return err(res, 409, "too_many_triggers");
+    const settings = await repo.getWalletSettings(w);
+    const blocked = policyBlocksEntry(settings.policy, rolloverDay(settings.day, now()), spec, exposureSum(settings.exposure));
+    if (blocked) return err(res, 409, blocked);
     const rec: TriggerRecord = {
       kind: "entry",
       version: 1,
@@ -296,8 +310,88 @@ export function mountTriggerApi(app: Express, deps: ApiDeps): void {
       absentEvals: 0,
     };
     await repo.insertTrigger(rec);
-    await repo.audit({ at: now(), wallet: w, triggerId: rec.id, event: "arm.stop", detail: { positionId: spec.positionId, instrumentId: spec.instrumentId, isLong: spec.isLong, stopPrice: spec.stopPrice, exit } });
+    await repo.audit({ at: now(), wallet: w, triggerId: rec.id, event: "arm.stop", detail: { positionId: spec.positionId, instrumentId: spec.instrumentId, isLong: spec.isLong, stopPrice: spec.stopPrice, exit, trail: spec.trail ?? null } });
     res.status(201).json(publicRecord(rec));
+  });
+
+  r.post("/triggers/ladder", requireAuth, requireMutation, limited(writeW, wallet), async (req, res) => {
+    const w = wallet(req);
+    const spec = validateArmLadderSpec(req.body, INSTRUMENTS);
+    if (!spec) return err(res, 400, "bad_spec");
+    if (spec.useDebt) return err(res, 400, "bad_spec", "useDebt is not supported for triggers.");
+    if (spec.expiresAt != null && spec.expiresAt <= now() + 30_000) return err(res, 400, "bad_spec", "expiresAt is in the past.");
+    if (!(await requireActiveKey(w, res))) return;
+    const live = await repo.countLiveTriggers(w);
+    if (live + spec.count > MAX_LIVE_TRIGGERS_PER_WALLET) return err(res, 409, "too_many_triggers");
+    const settings = await repo.getWalletSettings(w);
+    const day = rolloverDay(settings.day, now());
+    const exposed = exposureSum(settings.exposure);
+    const margins = splitMargin(spec.totalMarginUsdc, spec.count);
+    const prices = ladderPrices(spec.fromPrice, spec.toPrice, spec.count);
+    for (let i = 0; i < spec.count; i++) {
+      const blocked = policyBlocksEntry(settings.policy, day, { instrumentId: spec.instrumentId, marginUsdc: margins[i], leverage: spec.leverage }, exposed);
+      if (blocked) return err(res, 409, blocked);
+    }
+    const groupId = randomUUID();
+    const created: TriggerRecord[] = [];
+    for (let i = 0; i < spec.count; i++) {
+      const rec: TriggerRecord = {
+        kind: "entry",
+        version: 1,
+        id: randomUUID(),
+        wallet: w,
+        instrumentId: spec.instrumentId,
+        isLong: spec.isLong,
+        marginUsdc: margins[i],
+        leverage: spec.leverage,
+        useDebt: false,
+        triggerPrice: prices[i],
+        cross: spec.cross,
+        expiresAt: spec.expiresAt,
+        attachedStop: spec.attachedStop,
+        attachedTp: spec.attachedTp,
+        groupId,
+        status: "armed",
+        createdAt: now(),
+        confirmingSince: null,
+        crossSampleTs: null,
+      };
+      await repo.insertTrigger(rec);
+      created.push(rec);
+    }
+    await repo.audit({
+      at: now(),
+      wallet: w,
+      triggerId: created[0]?.id ?? null,
+      event: "arm.ladder",
+      detail: { groupId, count: spec.count, fromPrice: spec.fromPrice, toPrice: spec.toPrice, totalMarginUsdc: spec.totalMarginUsdc },
+    });
+    res.status(201).json({ groupId, entries: created.map(publicRecord) });
+  });
+
+  r.post("/triggers/group/:id/cancel", requireAuth, requireMutation, limited(writeW, wallet), async (req, res) => {
+    if (!idOk(req.params.id)) return err(res, 400, "bad_id");
+    const n = await repo.cancelGroup(wallet(req), req.params.id);
+    if (!n) return err(res, 404, "not_cancellable");
+    await repo.audit({ at: now(), wallet: wallet(req), triggerId: null, event: "cancel.group", detail: { groupId: req.params.id, n } });
+    res.json({ cancelled: n });
+  });
+
+  r.post("/triggers/policy", requireAuth, requireMutation, limited(writeW, wallet), async (req, res) => {
+    const policy = validateWalletPolicy(req.body?.policy ?? req.body);
+    if (!policy) return err(res, 400, "bad_spec");
+    const settings = await repo.setWalletPolicy(wallet(req), policy);
+    await repo.audit({ at: now(), wallet: wallet(req), triggerId: null, event: "policy.set", detail: { policy } });
+    res.json({ policy: settings.policy, day: rolloverDay(settings.day, now()) });
+  });
+
+  r.post("/triggers/policy/clear-trip", requireAuth, requireMutation, limited(writeW, wallet), async (req, res) => {
+    const w = wallet(req);
+    const cur = await repo.getWalletSettings(w);
+    const day = { ...rolloverDay(cur.day, now()), tripped: null };
+    await repo.saveWalletRuntime(w, day, cur.exposure);
+    await repo.audit({ at: now(), wallet: w, triggerId: null, event: "policy.clear", detail: {} });
+    res.json({ policy: cur.policy, day });
   });
 
   const idOk = (id: unknown): id is string => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id);

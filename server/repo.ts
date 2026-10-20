@@ -9,8 +9,8 @@
 //  - `casFire` is the single-fire gate: armed/confirming → firing exactly once;
 //  - `revokeKey` is atomic across key + triggers.
 
-import type { AttachedStop, ExitKind, StopLoss, TriggerEntry, TriggerStatus } from "../shared/triggerLogic";
-import { exitOf, isLive, isTerminal } from "../shared/triggerLogic";
+import type { AttachedStop, ExitKind, StopLoss, TriggerEntry, TriggerStatus, WalletDay, WalletPolicy } from "../shared/triggerLogic";
+import { emptyDay, exitOf, isLive, isTerminal } from "../shared/triggerLogic";
 
 export type TriggerRecord =
   | ({ kind: "entry"; version: number } & TriggerEntry)
@@ -66,7 +66,13 @@ export interface AuditEvent {
 
 export interface WalletSettings {
   enabled: boolean;
+  policy: WalletPolicy;
+  day: WalletDay;
+  /** positionId → notional of trigger-opened positions still being tracked */
+  exposure: Record<string, number>;
 }
+
+export const emptySettings = (): WalletSettings => ({ enabled: true, policy: {}, day: emptyDay(), exposure: {} });
 
 export interface Repo {
   // ---- triggers
@@ -97,6 +103,12 @@ export interface Repo {
   // ---- per-wallet settings
   getWalletSettings(wallet: string): Promise<WalletSettings>;
   setWalletEnabled(wallet: string, enabled: boolean): Promise<void>;
+  setWalletPolicy(wallet: string, policy: WalletPolicy): Promise<WalletSettings>;
+  /** persist day + exposure after a pass (rollover / PnL / fire count / trip) */
+  saveWalletRuntime(wallet: string, day: WalletDay, exposure: Record<string, number>): Promise<void>;
+  /** cancel waiting entries only (stops keep protecting) */
+  cancelLiveEntries(wallet: string, reason: string): Promise<number>;
+  cancelGroup(wallet: string, groupId: string): Promise<number>;
 
   // ---- keys
   getKey(wallet: string): Promise<KeyRow | null>;
@@ -275,10 +287,53 @@ export class MemoryRepo implements Repo {
   }
 
   async getWalletSettings(wallet: string) {
-    return this.settings.get(wallet.toLowerCase()) ?? { enabled: true };
+    const cur = this.settings.get(wallet.toLowerCase());
+    return cur ? clone(cur) : emptySettings();
+  }
+  private upsertSettings(wallet: string, patch: Partial<WalletSettings>): WalletSettings {
+    const w = wallet.toLowerCase();
+    const cur = this.settings.get(w) ?? emptySettings();
+    const next: WalletSettings = {
+      enabled: patch.enabled ?? cur.enabled,
+      policy: patch.policy ?? cur.policy,
+      day: patch.day ?? cur.day,
+      exposure: patch.exposure ?? cur.exposure,
+    };
+    this.settings.set(w, next);
+    return clone(next);
   }
   async setWalletEnabled(wallet: string, enabled: boolean) {
-    this.settings.set(wallet.toLowerCase(), { enabled });
+    this.upsertSettings(wallet, { enabled });
+  }
+  async setWalletPolicy(wallet: string, policy: WalletPolicy) {
+    const cur = this.settings.get(wallet.toLowerCase()) ?? emptySettings();
+    return this.upsertSettings(wallet, { policy, day: { ...cur.day, tripped: null } });
+  }
+  async saveWalletRuntime(wallet: string, day: WalletDay, exposure: Record<string, number>) {
+    this.upsertSettings(wallet, { day, exposure });
+  }
+  async cancelLiveEntries(wallet: string, reason: string) {
+    let n = 0;
+    for (const t of this.triggers.values()) {
+      if (t.kind === "entry" && t.wallet === wallet.toLowerCase() && (t.status === "armed" || t.status === "confirming" || t.status === "attention")) {
+        t.status = "cancelled";
+        t.error = reason;
+        t.version += 1;
+        n++;
+      }
+    }
+    return n;
+  }
+  async cancelGroup(wallet: string, groupId: string) {
+    let n = 0;
+    for (const t of this.triggers.values()) {
+      if (t.kind === "entry" && t.wallet === wallet.toLowerCase() && t.groupId === groupId && (t.status === "armed" || t.status === "confirming" || t.status === "attention")) {
+        t.status = "cancelled";
+        t.version += 1;
+        n++;
+      }
+    }
+    return n;
   }
 
   async getKey(wallet: string) {

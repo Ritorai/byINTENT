@@ -28,6 +28,7 @@ import {
   type StopLoss,
   type TriggerEntry,
   type TriggerStatus,
+  type WalletPolicy,
 } from "../shared/triggerLogic";
 import { CONTRACTS, hyperevm } from "./chain";
 import { MARKETS } from "./feed";
@@ -47,7 +48,7 @@ const cmpOf = (cross: "down-to" | "up-to") => (cross === "down-to" ? "≤" : "�
 /** a long stop fires at/below its price, a short stop at/above; a take-profit is the mirror */
 const stopCmp = (isLong: boolean, exit: ExitKind = "stop") => ((exit === "tp") !== isLong ? "≤" : "≥");
 const typeKey = (item: StopLoss | TriggerEntry, isEntry: boolean): I18nKey =>
-  isEntry ? "trig.type.entry" : exitOf(item as StopLoss) === "tp" ? "trig.type.tp" : "trig.type.stop";
+  isEntry ? "trig.type.entry" : exitOf(item as StopLoss) === "tp" ? "trig.type.tp" : (item as StopLoss).trail ? "trig.type.trail" : "trig.type.stop";
 const typeClass = (item: StopLoss | TriggerEntry, isEntry: boolean) => (isEntry ? "muted" : exitOf(item as StopLoss) === "tp" ? "trig-type-tp" : "trig-type-stop");
 
 const LIVE: ReadonlySet<TriggerStatus> = new Set(["armed", "confirming", "firing"]);
@@ -120,6 +121,7 @@ export function StopCell({
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [confirmPast, setConfirmPast] = useState(false);
+  const [trailOn, setTrailOn] = useState(false);
   const isTp = exit === "tp";
 
   if (!store) return <span className="muted">—</span>;
@@ -148,6 +150,7 @@ export function StopCell({
             pct: ((pnl / position.margin) * 100).toFixed(1),
           })}
         >
+          {armed.trail ? "T " : ""}
           {stopCmp(armed.isLong, exit)} {fmtPrice(armed.stopPrice)}
         </b>
         {armed.status !== "armed" && <Chip status={armed.status} />}
@@ -196,8 +199,12 @@ export function StopCell({
       </span>
     );
 
-  const stopPrice = Number(text);
-  const valid = text.trim() !== "" && Number.isFinite(stopPrice) && stopPrice > 0;
+  const typed = Number(text);
+  const trailPct = trailOn && !isTp;
+  const stopPrice = trailPct && priceRef != null && typed > 0
+    ? position.isLong ? priceRef * (1 - typed / 100) : priceRef * (1 + typed / 100)
+    : typed;
+  const valid = text.trim() !== "" && Number.isFinite(stopPrice) && stopPrice > 0 && (!trailPct || typed <= 50);
   const beyondBust = !isTp && valid && (position.isLong ? stopPrice < position.bustPrice : stopPrice > position.bustPrice);
   // a take-profit on the loss side of the entry would lock in a loss, not a profit
   const wrongSide = isTp && valid && (position.isLong ? stopPrice <= position.entryPrice : stopPrice >= position.entryPrice);
@@ -239,6 +246,7 @@ export function StopCell({
         isLong: position.isLong,
         stopPrice,
         ...(isTp ? { exit: "tp" as const } : {}),
+        ...(!isTp && trailOn ? { trail: { mode: "pct" as const, value: typed / 100 } } : {}),
       })
       .then((r) =>
         onNote(
@@ -259,6 +267,19 @@ export function StopCell({
 
   return (
     <span className="stopcell open">
+      {!isTp && (
+        <button
+          className={trailOn ? "addstop addtp" : "addstop"}
+          title={t("trig.trailWhy")}
+          onClick={() => {
+            setTrailOn((v) => !v);
+            setText((cur) => (cur.trim() === "" ? "2" : cur));
+            setConfirmPast(false);
+          }}
+        >
+          {t("trig.trail")}
+        </button>
+      )}
       <input
         type="number"
         inputMode="decimal"
@@ -268,7 +289,7 @@ export function StopCell({
         className={warn ? "warn-input" : undefined}
         title={warn ?? t(isTp ? "trig.tpClosesEntire" : "trig.closesEntire")}
         aria-label={t(isTp ? "trig.tpPrice" : "trig.stopPrice")}
-        placeholder={t(isTp ? "trig.tpPrice" : "trig.stopPrice")}
+        placeholder={trailOn && !isTp ? t("trig.trailPct") : t(isTp ? "trig.tpPrice" : "trig.stopPrice")}
         value={text}
         onChange={(e) => {
           setText(e.target.value);
@@ -303,9 +324,11 @@ export function StopCell({
 
 /** "−2 %" / "+4 %" or "≤ 80,000" — how an attached exit reads in a cell */
 function attachedStopText(a: AttachedStop, isLong: boolean, exit: ExitKind = "stop"): string {
-  return a.mode === "pct"
-    ? `${exit === "tp" ? "+" : "−"}${(a.value * 100).toFixed(a.value * 100 < 1 ? 2 : 1).replace(/\.0$/, "")} %`
-    : `${stopCmp(isLong, exit)} ${fmtPrice(a.value)}`;
+  const core =
+    a.mode === "pct"
+      ? `${exit === "tp" ? "+" : "−"}${(a.value * 100).toFixed(a.value * 100 < 1 ? 2 : 1).replace(/\.0$/, "")} %`
+      : `${stopCmp(isLong, exit)} ${fmtPrice(a.value)}`;
+  return a.trail ? `T ${core}` : core;
 }
 
 /** default % offsets for a fresh attached exit: 2 % stop, 4 % take-profit (a 2R bracket) */
@@ -323,6 +346,7 @@ function EntryStopCell({ store, entry, onNote, which = "stop" }: { store: Trigge
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<"pct" | "price">(a?.mode ?? "pct");
   const [text, setText] = useState("");
+  const [trailOn, setTrailOn] = useState(!!a?.trail);
   const report = (p: Promise<ApiResult>) =>
     p.then((r) => {
       if (!r.ok) onNote(apiErrorText(t, r));
@@ -376,7 +400,7 @@ function EntryStopCell({ store, entry, onNote, which = "stop" }: { store: Trigge
 
   const n = Number(text);
   const typed = text.trim() !== "" && Number.isFinite(n) && n > 0;
-  const next: AttachedStop | null = typed ? { mode, value: mode === "pct" ? n / 100 : n } : null;
+  const next: AttachedStop | null = typed ? { mode, value: mode === "pct" ? n / 100 : n, ...( !isTp && trailOn ? { trail: true } : {}) } : null;
   const problem = next ? (isTp ? attachedTpProblem(next, entry) : attachedStopProblem(next, entry)) : null;
   const warn =
     problem === "wrong-side" ? t(isTp ? "ticket.p.tpWrongSide" : "ticket.p.stopWrongSide") : problem === "beyond-bust" ? t("ticket.p.stopBeyondBust") : null;
@@ -413,6 +437,11 @@ function EntryStopCell({ store, entry, onNote, which = "stop" }: { store: Trigge
       >
         {mode === "pct" ? "%" : "$"}
       </button>
+      {!isTp && (
+        <button className={trailOn ? "addstop addtp" : "addstop"} title={t("trig.trailWhy")} onClick={() => setTrailOn((v) => !v)}>
+          {t("trig.trail")}
+        </button>
+      )}
       <input
         type="number"
         inputMode="decimal"
@@ -555,6 +584,17 @@ function OrderRow({
       <span className="trig-actions">
         {entry && <EntryStopCell store={store} entry={entry} onNote={onNote} which="stop" />}
         {entry && <EntryStopCell store={store} entry={entry} onNote={onNote} which="tp" />}
+        {entry?.groupId && live && (
+          <button
+            className="close-btn"
+            title={t("ladder.cancelRest")}
+            onClick={() =>
+              void store.cancelGroup(entry.groupId!).then((r) => onNote(r.ok ? t("ladder.cancelled") : apiErrorText(t, r)))
+            }
+          >
+            {t("ladder.cancelRest")}
+          </button>
+        )}
         {live && (
           <button className="close-btn" onClick={() => report(store.cancel(item.id))}>
             {t("trig.cancel")}
@@ -593,6 +633,139 @@ function fmtAge(ms: number): string {
  * it on. Right: the key and its revoke links. Real problems (watcher offline,
  * operator pause, expiring key) are one-line banners under it; nothing else.
  */
+function PolicyLimits({ store, onNote }: { store: TriggerStore; onNote: (msg: string) => void }) {
+  const { t } = useI18n();
+  const me = store.me;
+  const policy = me?.policy ?? {};
+  const day = me?.day;
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [maxNotional, setMaxNotional] = useState("");
+  const [maxExposure, setMaxExposure] = useState("");
+  const [dailyLoss, setDailyLoss] = useState("");
+  const [maxFires, setMaxFires] = useState("");
+  const [maxLev, setMaxLev] = useState("");
+  const [btc, setBtc] = useState(true);
+  const [eth, setEth] = useState(true);
+
+  useEffect(() => {
+    if (!me) return;
+    const p = me.policy ?? {};
+    setMaxNotional(p.maxNotionalPerFire != null ? String(p.maxNotionalPerFire) : "");
+    setMaxExposure(p.maxTriggerExposure != null ? String(p.maxTriggerExposure) : "");
+    setDailyLoss(p.dailyLossStop != null ? String(p.dailyLossStop) : "");
+    setMaxFires(p.maxFiresPerDay != null ? String(p.maxFiresPerDay) : "");
+    setMaxLev(p.maxLeverage != null ? String(p.maxLeverage) : "");
+    const allow = p.allowedInstruments;
+    setBtc(!allow || allow.includes(MARKETS.BTC.id));
+    setEth(!allow || allow.includes(MARKETS.ETH.id));
+  }, [me, open]);
+
+  const num = (s: string): number | null => {
+    const n = Number(s);
+    return s.trim() === "" ? null : Number.isFinite(n) && n > 0 ? n : null;
+  };
+
+  const save = async () => {
+    const next: WalletPolicy = {};
+    const a = num(maxNotional);
+    const b = num(maxExposure);
+    const c = num(dailyLoss);
+    const d = num(maxFires);
+    const e = num(maxLev);
+    if (maxNotional.trim() && a == null) return onNote(t("policy.bad"));
+    if (maxExposure.trim() && b == null) return onNote(t("policy.bad"));
+    if (dailyLoss.trim() && c == null) return onNote(t("policy.bad"));
+    if (maxFires.trim() && (d == null || !Number.isInteger(d))) return onNote(t("policy.bad"));
+    if (maxLev.trim() && (e == null || !Number.isInteger(e))) return onNote(t("policy.bad"));
+    if (a != null) next.maxNotionalPerFire = a;
+    if (b != null) next.maxTriggerExposure = b;
+    if (c != null) next.dailyLossStop = c;
+    if (d != null) next.maxFiresPerDay = d;
+    if (e != null) next.maxLeverage = e;
+    if (btc !== eth) next.allowedInstruments = [btc ? MARKETS.BTC.id : MARKETS.ETH.id];
+    setBusy(true);
+    const r = await store.setPolicy(next);
+    setBusy(false);
+    if (!r.ok) onNote(apiErrorText(t, r));
+    else {
+      onNote(t("policy.saved"));
+      setOpen(false);
+    }
+  };
+
+  const tripped = day?.tripped;
+  const caps = [policy.maxNotionalPerFire, policy.maxTriggerExposure, policy.dailyLossStop, policy.maxFiresPerDay, policy.maxLeverage].filter((x) => x != null).length;
+
+  return (
+    <div className="policy">
+      <button className="linklike policy-toggle" onClick={() => setOpen((v) => !v)}>
+        {t("policy.title")}
+        {caps ? ` · ${caps}` : ""}
+        {tripped ? ` · ${t("policy.tripped")}` : ""}
+      </button>
+      {tripped && (
+        <span className="policy-trip">
+          {t("policy.tripLine", { pnl: fmtUsd(Math.abs(day?.realizedPnl ?? 0)) })}
+          <button
+            className="linklike"
+            onClick={() =>
+              void store.clearPolicyTrip().then((r) => {
+                if (!r.ok) onNote(apiErrorText(t, r));
+                else onNote(t("policy.cleared"));
+              })
+            }
+          >
+            {t("policy.clear")}
+          </button>
+        </span>
+      )}
+      {open && (
+        <div className="policy-form">
+          <label>
+            {t("policy.maxNotional")}
+            <input inputMode="decimal" value={maxNotional} onChange={(e) => setMaxNotional(e.target.value)} placeholder="—" />
+          </label>
+          <label>
+            {t("policy.maxExposure")}
+            <input inputMode="decimal" value={maxExposure} onChange={(e) => setMaxExposure(e.target.value)} placeholder="—" />
+          </label>
+          <label>
+            {t("policy.dailyLoss")}
+            <input inputMode="decimal" value={dailyLoss} onChange={(e) => setDailyLoss(e.target.value)} placeholder="—" />
+          </label>
+          <label>
+            {t("policy.maxFires")}
+            <input inputMode="decimal" value={maxFires} onChange={(e) => setMaxFires(e.target.value)} placeholder="—" />
+          </label>
+          <label>
+            {t("policy.maxLev")}
+            <input inputMode="decimal" value={maxLev} onChange={(e) => setMaxLev(e.target.value)} placeholder="—" />
+          </label>
+          <div className="policy-mkts">
+            <button className={btc ? "preset on" : "preset"} onClick={() => setBtc((v) => !v)}>
+              BTC
+            </button>
+            <button className={eth ? "preset on" : "preset"} onClick={() => setEth((v) => !v)}>
+              ETH
+            </button>
+          </div>
+          <div className="policy-today muted">
+            {t("policy.today", {
+              pnl: `${(day?.realizedPnl ?? 0) >= 0 ? "+" : ""}${fmtUsd(day?.realizedPnl ?? 0)}`,
+              fires: String(day?.fires ?? 0),
+              exp: fmtUsd(me?.exposure ?? 0),
+            })}
+          </div>
+          <button className="addstop" disabled={busy || (!btc && !eth)} onClick={() => void save()}>
+            {busy ? "…" : t("policy.save")}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function WatcherPanel({
   store,
   nowTick,
@@ -760,6 +933,7 @@ export function WatcherPanel({
           )}
         </span>
       </div>
+      <PolicyLimits store={store} onNote={onNote} />
     </>
   );
 }
