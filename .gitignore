@@ -1,0 +1,10 @@
+node_modules/
+dist/
+server-dist/
+demo/
+_frames/
+_probe_*.json
+_probe_*.txt
+_hl_body.json
+*.local
+.DS_Store

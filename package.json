@@ -1,0 +1,38 @@
+{
+  "name": "byintent",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "byINTENT - a minimal trading terminal for papertrade.xyz with server-side trigger orders and stops",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && tsc --noEmit -p server/tsconfig.json && vite build && node scripts/build-server.mjs",
+    "build:server": "tsc --noEmit -p server/tsconfig.json && node scripts/build-server.mjs",
+    "preview": "vite preview",
+    "start": "node server.mjs",
+    "watcher": "node server-dist/watcher.mjs"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.104.2",
+    "express": "^4.21.2",
+    "pg": "^8.23.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "viem": "^2.57.6",
+    "wagmi": "^3.7.7"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.25",
+    "@types/node": "^20.19.43",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  }
+}
